@@ -1,0 +1,21 @@
+[package]
+name = "ironwood-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+byteorder = "1.4.3"
+ed25519-dalek = "1.0.1"
+hex = "0.4.3"
+integer-encoding = "3.0.4"
+chrono = "0.4.24"
+rand = { version = "0.8.5", features = ["getrandom"]}
+tokio = { version = "1.28.2", features = ["sync", "net", "tokio-macros", "macros", "io-util", "time", "rt"] }
+bytes = "1.4.0"
+sodiumoxide = "0.2.7"
+sha2 = "0.10.6"
+futures = "0.3.28"
+log = "0.4.18"
+rand_07 = { package = "rand", version = "0.7.3" }
