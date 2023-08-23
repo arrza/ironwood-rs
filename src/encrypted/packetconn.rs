@@ -20,7 +20,7 @@ pub struct PacketConnRead {
 impl PacketConnRead {
     // The read_from method fulfills the net.PacketConn interface, with a types.Addr returned as the from address.
     // Note that failing to call read_from may cause the connection to block and/or leak memory.
-    pub async fn read_from(&mut self, p: &mut [u8]) -> Result<(usize, u8, Addr), Box<dyn Error>> {
+    pub async fn read_from(&mut self, p: &mut [u8]) -> Result<(usize, u8, Addr), String> {
         debug!("++PacketConnRead: read_from");
         if let Some(info) = self.network.read_ch.recv().await {
             let data = info.data;

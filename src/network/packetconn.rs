@@ -163,10 +163,8 @@ impl PacketConn {
             return Err("attempted to connect to self".into());
         }
         let (p, conn) = core.peers.add_peer(pk, conn, prio).await?;
-        tokio::spawn(async move {
-            let _ = conn.handler().await;
-            core.peers.remove_peer(p.port).await;
-        });
+        let _ = conn.handler().await;
+        core.peers.remove_peer(p.port).await;
         Ok(())
     }
 
