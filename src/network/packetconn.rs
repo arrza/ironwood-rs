@@ -31,6 +31,7 @@ pub struct PacketConn {
 }
 
 pub type OobHandlerTx = mpsc::Sender<(PublicKeyBytes, PublicKeyBytes, Vec<u8>)>;
+pub type OobHandlerRx = mpsc::Receiver<(PublicKeyBytes, PublicKeyBytes, Vec<u8>)>;
 
 #[derive(Clone)]
 pub struct PacketConnHandle {
