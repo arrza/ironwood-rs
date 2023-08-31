@@ -1,5 +1,5 @@
 use ed25519_dalek::PublicKey;
-use std::fmt;
+use std::{error::Error, fmt};
 
 use crate::network::crypto::PublicKeyBytes;
 
@@ -52,3 +52,15 @@ impl Into<PublicKeyBytes> for Addr {
         self.0
     }
 }
+
+#[derive(Debug)]
+enum IrwdError {
+    
+}
+
+impl fmt::Display for IrwdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "irwd error")
+    }
+}
+impl Error for IrwdError {}

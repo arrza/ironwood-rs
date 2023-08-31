@@ -96,7 +96,7 @@ impl PacketConn {
         }
         self.sessions
             .write_to(EdPub::from_slice(&addr.0 .0).unwrap(), p)
-            .await;
+            .await?;
         Ok(())
     }
 

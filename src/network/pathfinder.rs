@@ -159,7 +159,7 @@ impl PathfinderHandle {
 
 impl Pathfinder {
     pub fn new(dhtree: DhtreeHandle, crypto: Arc<Crypto>) -> (PathfinderHandle, PathfinderQueue) {
-        let (queue_tx, queue_rx) = mpsc::channel(10);
+        let (queue_tx, queue_rx) = mpsc::channel(100);
         let handle = PathfinderHandle {
             paths: Arc::new(Mutex::new(HashMap::new())),
             dhtree,

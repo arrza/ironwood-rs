@@ -16,6 +16,7 @@ use log::debug;
 use std::{
     collections::HashMap,
     error::Error,
+    fmt::{self, Display, Formatter},
     io::Cursor,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -61,9 +62,22 @@ impl Into<u8> for SessionType {
 }
 
 #[derive(Debug)]
-enum SessionManagerMessages {
+pub enum SessionManagerMessages {
     WriteTo(EdPub, Vec<u8>),
     HandleData(EdPub, Vec<u8>),
+}
+
+impl Display for SessionManagerMessages {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionManagerMessages::WriteTo(pub_, msg) => {
+                write!(f, "WriteTo({}, {})", hex::encode(pub_.0), msg.len())
+            }
+            SessionManagerMessages::HandleData(pub_, msg) => {
+                write!(f, "HandleData({}, {})", hex::encode(pub_.0), msg.len())
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -144,10 +158,14 @@ pub struct SessionManagerQueue {
 }
 
 impl SessionManagerHandle {
-    pub async fn write_to(&self, to_key: EdPub, msg: &[u8]) {
+    pub async fn write_to(
+        &self,
+        to_key: EdPub,
+        msg: &[u8],
+    ) -> Result<(), mpsc::error::SendError<SessionManagerMessages>> {
         self.queue
             .send(SessionManagerMessages::WriteTo(to_key, msg.to_vec()))
-            .await;
+            .await
     }
 
     pub async fn handle_data(&mut self, pub_: EdPub, data: &[u8]) {
@@ -201,7 +219,7 @@ impl SessionManager {
     pub async fn handler(&mut self) {
         debug!("++SessionManager: handler");
         while let Some(msg) = self.queue.recv().await {
-            debug!("  SessionManager: {:?}", msg);
+            debug!("  SessionManager: {}", msg);
             match msg {
                 SessionManagerMessages::WriteTo(to_key, msg) => {
                     self.write_to(to_key, &msg).await.unwrap()

@@ -9,23 +9,27 @@ use crate::types::PeerPort;
 use byteorder::{BigEndian, ReadBytesExt};
 use futures::{future::BoxFuture, FutureExt};
 use integer_encoding::{VarInt, VarIntReader};
-use log::debug;
+use log::{debug, error};
 use std::{
     borrow::Borrow,
     cell::RefCell,
     collections::{HashMap, HashSet},
-    fmt,
+    error::Error,
+    fmt::{self},
     io::{Cursor, Read},
     sync::{atomic, Arc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::Timeout,
+};
 
 pub const TREE_TIMEOUT_SECS: u64 = 60 * 60;
 pub const TREE_TIMEOUT: Duration = Duration::from_secs(TREE_TIMEOUT_SECS); // TODO: figure out what makes sense
 pub const TREE_ANNOUNCE: Duration = Duration::from_secs(TREE_TIMEOUT_SECS / 2);
 pub const TREE_THROTTLE: Duration = Duration::from_secs(TREE_TIMEOUT_SECS / 4); // TODO: use this to limit how fast seqs can update
-
+pub const WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Debug)]
 pub struct DebugSelfInfo {
     key: PublicKeyBytes,
@@ -272,15 +276,29 @@ impl Dhtree {
             debug!("Dhtree msg ({:?})", msg);
             match msg {
                 DhtreeMessages::DhtTraffic(tr, do_notify) => {
-                    self.handle_dht_traffic(tr, do_notify).await
+                    if let Err(e) =
+                        tokio::time::timeout(WAIT_TIMEOUT, self.handle_dht_traffic(tr, do_notify))
+                            .await
+                    {
+                        error!("DhtTraffic timeout: {}", e)
+                    }
                 }
                 DhtreeMessages::Bootstrap(bootstrap) => self._handle_bootstrap(&bootstrap).await,
                 DhtreeMessages::Remove(p) => self.remove(p).await,
                 DhtreeMessages::Teardown(from, teardown) => self._teardown(from, &teardown).await,
-                DhtreeMessages::BootstrapAck(ack) => self.handle_bootstrap_ack(&ack).await,
+                DhtreeMessages::BootstrapAck(ack) => {
+                    if let Err(e) = self.handle_bootstrap_ack(&ack).await {
+                        error!("BootstrapAck handle error: {}", e);
+                    }
+                }
                 DhtreeMessages::Setup(prev, setup) => self._handle_setup(prev, &setup).await,
                 DhtreeMessages::Update(info, p) => self._update(info, p).await,
-                DhtreeMessages::SendTraffic(tr) => self.send_traffic(tr).await,
+                DhtreeMessages::SendTraffic(tr) => {
+                    if let Err(e) = tokio::time::timeout(WAIT_TIMEOUT, self.send_traffic(tr)).await
+                    {
+                        error!("Send traffic timeout: {:?}", e)
+                    }
+                }
                 DhtreeMessages::DhtLookup(dest, is_bootstrap, tx) => {
                     let id = self
                         ._dht_lookup(&dest, is_bootstrap)
@@ -921,14 +939,14 @@ impl Dhtree {
     // if no, then we decide whether or not this node is better than our current prev
     // if yes, then we get rid of our current prev (if any) and start setting up a new path to the response node in the ack
     // if no, then we drop the bootstrap acknowledgement without doing anything
-    async fn handle_bootstrap_ack(&mut self, ack: &DhtBootstrapAck) {
+    async fn handle_bootstrap_ack(&mut self, ack: &DhtBootstrapAck) -> Result<(), String> {
         debug!("Dhtree _handle_bootstrap_ack.");
         let source = ack.response.dest.key.clone();
         if let Some(next) = self._tree_lookup(&ack.bootstrap.label) {
             debug!("Dhtree _handle_bootstrap_ack.1");
-            next.send_bootstrap_ack(ack).unwrap();
+            next.send_bootstrap_ack(ack).map_err(|e| e.to_string())?;
             debug!("Dhtree _handle_bootstrap_ack.1.end");
-            return;
+            return Ok(());
         }
 
         if self.core.crypto.public_key == source
@@ -938,7 +956,7 @@ impl Dhtree {
             || self.self_info.as_ref().unwrap().seq != ack.response.dest.seq
         {
             debug!("Dhtree _handle_bootstrap_ack.2.end");
-            return;
+            return Ok(());
         } else if self.prev.as_ref().is_none()
             || dht_ordered(
                 self.dkeys.get(self.prev.as_ref().unwrap()).unwrap(),
@@ -948,18 +966,18 @@ impl Dhtree {
         {
         } else if &source != self.dkeys.get(self.prev.as_ref().unwrap()).unwrap() {
             debug!("Dhtree _handle_bootstrap_ack.3.end");
-            return;
+            return Ok(());
         } else if self.prev.as_ref().unwrap().root != self.self_info.as_ref().unwrap().root
             || self.prev.as_ref().unwrap().root_seq != self.self_info.as_ref().unwrap().seq
         {
         } else {
             debug!("Dhtree _handle_bootstrap_ack.4.end");
-            return;
+            return Ok(());
         }
 
         if !ack.response.check() {
             // Final thing to check, if the signatures are bad then ignore it
-            return;
+            return Ok(());
         }
 
         self.prev = None;
@@ -982,6 +1000,7 @@ impl Dhtree {
         let mut setup = self._new_setup(&ack.response);
         self._handle_setup(PeerId::nil(), &mut setup).await;
         debug!("Dhtree _handle_bootstrap_ack.end");
+        Ok(())
     }
 
     fn _new_setup(&mut self, token: &DhtSetupToken) -> DhtSetup {
@@ -1239,7 +1258,9 @@ impl Dhtree {
                     path,
                     dt: tr.clone(),
                 };
-                self.peers.handle_path_traffic(pt);
+                if let Err(e) = self.peers.handle_path_traffic(pt) {
+                    error!("  handle_path_traffic error: {:?}", e);
+                }
             } else {
                 self.handle_dht_traffic(tr, false).await;
             }
