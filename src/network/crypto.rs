@@ -29,7 +29,7 @@ impl PublicKeyBytes {
     }
 
     pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_SIZE] {
-        self.0.clone()
+        self.0
     }
 
     pub fn verify(&self, message: &[u8], sig: &[u8]) -> bool {
@@ -44,9 +44,9 @@ impl PublicKeyBytes {
     }
 }
 
-impl Into<Addr> for PublicKeyBytes {
-    fn into(self) -> Addr {
-        Addr(self)
+impl From<PublicKeyBytes> for Addr {
+    fn from(val: PublicKeyBytes) -> Self {
+        Addr(val)
     }
 }
 
@@ -56,9 +56,9 @@ impl From<PublicKey> for PublicKeyBytes {
     }
 }
 
-impl Into<PublicKey> for PublicKeyBytes {
-    fn into(self) -> PublicKey {
-        PublicKey::from_bytes(&self.0).unwrap()
+impl From<PublicKeyBytes> for PublicKey {
+    fn from(val: PublicKeyBytes) -> Self {
+        PublicKey::from_bytes(&val.0).unwrap()
     }
 }
 

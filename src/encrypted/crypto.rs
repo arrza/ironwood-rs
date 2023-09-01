@@ -4,24 +4,6 @@ use sodiumoxide::crypto::sign::ed25519;
 
 use crate::network::crypto::PublicKeyBytes;
 
-/********
- * util *
- ********/
-
-fn bytes_equal(a: &[u8], b: &[u8]) -> bool {
-    a == b
-}
-
-fn bytes_push(dest: &mut [u8], source: &[u8], offset: usize) -> usize {
-    dest[offset..offset + source.len()].copy_from_slice(source);
-    offset + source.len()
-}
-
-fn bytes_pop(dest: &mut [u8], source: &[u8], offset: usize) -> usize {
-    dest.copy_from_slice(&source[offset..offset + dest.len()]);
-    offset + dest.len()
-}
-
 /******
  * ed *
  ******/
@@ -35,17 +17,17 @@ pub type EdPriv = ed25519::SecretKey;
 pub type EdSig = [u8; ED_SIG_SIZE];
 
 pub fn ed_sign(msg: &[u8], priv_key: &EdPriv) -> EdSig {
-    let signature = ed25519::sign_detached(msg, &priv_key);
+    let signature = ed25519::sign_detached(msg, priv_key);
     signature.to_bytes()
 }
 
 pub fn ed_check(msg: &[u8], sig: &EdSig, pub_key: &EdPub) -> bool {
     let signature = ed25519::Signature::from_bytes(sig).unwrap();
-    ed25519::verify_detached(&signature, msg, &pub_key)
+    ed25519::verify_detached(&signature, msg, pub_key)
 }
 
 pub fn to_box(pub_key: &EdPub) -> BoxPub {
-    let curve25519_pk = sodiumoxide::crypto::sign::ed25519::to_curve25519_pk(&pub_key)
+    sodiumoxide::crypto::sign::ed25519::to_curve25519_pk(pub_key)
         .map_err(|e| {
             debug!(
                 "Invalid Public Key: {:?} pk: {}",
@@ -53,18 +35,15 @@ pub fn to_box(pub_key: &EdPub) -> BoxPub {
                 PublicKeyBytes(pub_key.0)
             )
         })
-        .unwrap();
-    curve25519_pk
+        .unwrap()
 }
 
 pub fn to_box_priv(priv_key: &EdPriv) -> BoxPriv {
-    let curve25519_sk = sodiumoxide::crypto::sign::ed25519::to_curve25519_sk(&priv_key).unwrap();
-    curve25519_sk
+    sodiumoxide::crypto::sign::ed25519::to_curve25519_sk(priv_key).unwrap()
 }
 
 pub fn pub_from_priv(priv_key: &EdPriv) -> EdPub {
-    let public_key = ed25519::PublicKey::from_slice(&priv_key[32..]).unwrap();
-    public_key
+    ed25519::PublicKey::from_slice(&priv_key[32..]).unwrap()
 }
 
 /*******
@@ -88,7 +67,7 @@ pub fn new_box_keys() -> (BoxPub, BoxPriv) {
 }
 
 pub fn get_shared(pub_key: &BoxPub, priv_key: &BoxPriv) -> BoxShared {
-    let shared = box_::precompute(&pub_key, &priv_key);
+    let shared = box_::precompute(pub_key, priv_key);
     shared.0
 }
 
@@ -105,8 +84,7 @@ pub fn box_seal(msg: &[u8], nonce: u64, shared: &BoxShared) -> Vec<u8> {
     let nonce_array = nonce_for_uint64(nonce);
     let nonce = box_::Nonce::from_slice(&nonce_array).unwrap();
     let shared_key = box_::PrecomputedKey::from_slice(shared).unwrap();
-    let boxed_msg = box_::seal_precomputed(msg, &nonce, &shared_key);
-    boxed_msg
+    box_::seal_precomputed(msg, &nonce, &shared_key)
 }
 
 pub fn nonce_for_uint64(u64: u64) -> BoxNonce {

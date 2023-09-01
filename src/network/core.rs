@@ -35,7 +35,7 @@ impl Core {
             crypto,
             dhtree: dhtree.clone(),
             peers: peers_handle,
-            pconn: pconn,
+            pconn,
             pathfinder: pathfinder.clone(),
         };
         let core = Arc::new(core);

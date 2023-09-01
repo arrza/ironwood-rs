@@ -12,18 +12,14 @@ use integer_encoding::{VarInt, VarIntReader};
 use log::{debug, error};
 use std::{
     borrow::Borrow,
-    cell::RefCell,
+    cmp,
     collections::{HashMap, HashSet},
-    error::Error,
     fmt::{self},
     io::{Cursor, Read},
     sync::{atomic, Arc},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    time::Timeout,
-};
+use tokio::sync::{mpsc, oneshot};
 
 pub const TREE_TIMEOUT_SECS: u64 = 60 * 60;
 pub const TREE_TIMEOUT: Duration = Duration::from_secs(TREE_TIMEOUT_SECS); // TODO: figure out what makes sense
@@ -418,7 +414,7 @@ impl Dhtree {
     async fn _send_tree(&self) {
         for pid in self.tinfos.keys() {
             let p = self.peers.get_peer(*pid);
-            p.send_tree(&self.self_info.as_ref().unwrap()).unwrap();
+            p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
         }
     }
 
@@ -460,7 +456,7 @@ impl Dhtree {
         if !self.tinfos.contains_key(&p.id) {
             // The peer may have missed an update due to a race between creating the peer and now
             // The easiest way to fix the problem is to just send it another update right now
-            p.send_tree(&self.self_info.as_ref().unwrap()).unwrap();
+            p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
         }
 
         self.tinfos.insert(p.id, info.clone());
@@ -525,7 +521,7 @@ impl Dhtree {
             self._fix().await;
         }
 
-        let dinfos: Vec<_> = { self.dinfos.values().map(|v| v.clone()).collect() };
+        let dinfos: Vec<_> = { self.dinfos.values().cloned().collect() };
         for dinfo in dinfos {
             if dinfo.peer == p || dinfo.rest == p {
                 self._teardown(p, &dinfo.get_teardown()).await;
@@ -595,7 +591,7 @@ impl Dhtree {
                 debug!("fix.2");
                 // This is a better root
                 self.self_info = Some(info.clone());
-                self.parent = p.clone();
+                self.parent = *p;
             } else if tree_less(&self.self_info.as_ref().unwrap().root, &info.root) {
                 debug!("fix.3");
                 // This is a worse root, so don't do anything with it
@@ -603,7 +599,7 @@ impl Dhtree {
                 debug!("fix.4");
                 // This is a newer sequence number, so update parent
                 self.self_info = Some(info.clone());
-                self.parent = p.clone();
+                self.parent = *p;
             } else if info.seq < self.self_info.as_ref().unwrap().seq {
                 debug!("fix.5");
                 // This is an older sequence number, so ignore it
@@ -611,7 +607,7 @@ impl Dhtree {
                 debug!("fix.6");
                 // This info has been around for longer (e.g. the path is more stable)
                 self.self_info = Some(info.clone());
-                self.parent = p.clone();
+                self.parent = *p;
             }
         }
         debug!("fix: parent {}", self.parent);
@@ -707,13 +703,13 @@ impl Dhtree {
     // this only uses the source direction of paths through the dht
     // bootstraps use slightly different logic, since they need to stop short of the destination key
     fn _dht_lookup(&self, dest: &PublicKeyBytes, is_bootstrap: bool) -> Option<Arc<Peer>> {
-        type STATE = (PublicKeyBytes, Option<PeerId>, Option<Arc<DhtInfo>>);
-        fn do_update(state: &mut STATE, key: PublicKeyBytes, p: PeerId, d: Option<Arc<DhtInfo>>) {
+        type State = (PublicKeyBytes, Option<PeerId>, Option<Arc<DhtInfo>>);
+        fn do_update(state: &mut State, key: PublicKeyBytes, p: PeerId, d: Option<Arc<DhtInfo>>) {
             *state = (key, Some(p), d);
         }
 
         fn do_checked_update(
-            state: &mut STATE,
+            state: &mut State,
             dest: &PublicKeyBytes,
             is_bootstrap: bool,
             key: PublicKeyBytes,
@@ -721,33 +717,26 @@ impl Dhtree {
             _d: Option<Arc<DhtInfo>>,
         ) {
             let best = &state.0;
-            if (!is_bootstrap && key == *dest && best != dest) || dht_ordered(&best, &key, dest) {
+            if (!is_bootstrap && key == *dest && best != dest) || dht_ordered(best, &key, dest) {
                 *state = (key, Some(p), None);
             }
         }
         fn do_ancestry(
-            state: &mut STATE,
+            state: &mut State,
             dhtree: &Dhtree,
             dest: &PublicKeyBytes,
             is_bootstrap: bool,
             info: &TreeInfo,
             p: PeerId,
         ) {
-            do_checked_update(
-                state,
-                dest,
-                is_bootstrap,
-                info.root.clone(),
-                p.clone(),
-                None,
-            );
+            do_checked_update(state, dest, is_bootstrap, info.root.clone(), p, None);
             for hop in &info.hops {
-                do_checked_update(state, dest, is_bootstrap, hop.next.clone(), p.clone(), None);
-                let best_peer = state.1.clone();
+                do_checked_update(state, dest, is_bootstrap, hop.next.clone(), p, None);
+                let best_peer = state.1.as_ref();
                 if let Some(best_peer) = best_peer {
-                    if let Some(tinfo) = dhtree.tinfos.get(state.1.as_ref().unwrap()) {
+                    if let Some(tinfo) = dhtree.tinfos.get(best_peer) {
                         if state.0 == hop.next && info.hseq < tinfo.hseq {
-                            do_update(state, hop.next.clone(), p.clone(), None);
+                            do_update(state, hop.next.clone(), p, None);
                         }
                     }
                 }
@@ -755,7 +744,7 @@ impl Dhtree {
         }
 
         fn do_dht(
-            state: &mut STATE,
+            state: &mut State,
             dest: &PublicKeyBytes,
             is_bootstrap: bool,
             info: &Arc<DhtInfo>,
@@ -765,27 +754,16 @@ impl Dhtree {
                 dest,
                 is_bootstrap,
                 info.key.clone(),
-                info.peer.clone(),
+                info.peer,
                 Some(info.clone()),
             );
             let best_info = state.2.clone();
             if let Some(best_info) = best_info {
-                if info.key == best_info.key {
-                    if tree_less(&info.root, &best_info.root) {
-                        do_update(
-                            state,
-                            info.key.clone(),
-                            info.peer.clone(),
-                            Some(info.clone()),
-                        );
-                    } else if info.root == best_info.root && info.root_seq > best_info.root_seq {
-                        do_update(
-                            state,
-                            info.key.clone(),
-                            info.peer.clone(),
-                            Some(info.clone()),
-                        );
-                    }
+                if info.key == best_info.key
+                    && (tree_less(&info.root, &best_info.root)
+                        || (info.root == best_info.root && info.root_seq > best_info.root_seq))
+                {
+                    do_update(state, info.key.clone(), info.peer, Some(info.clone()));
                 }
             }
         }
@@ -794,20 +772,12 @@ impl Dhtree {
         let mut state = (self.core.crypto.public_key.clone(), None, None);
 
         debug!("lookup.1 {}", dest);
-        if (is_bootstrap && state.borrow().0/*best*/ == *dest)
-            || dht_ordered(
-                &self.self_info.as_ref().unwrap().root,
-                dest,
-                &state.borrow().0,
-            )
-        {
-            do_update(
-                &mut state,
-                self.self_info.as_ref().unwrap().root.clone(),
-                self.parent.clone(),
-                None,
-            );
-        }
+        do_update(
+            &mut state,
+            self.self_info.as_ref().unwrap().root.clone(),
+            self.parent,
+            None,
+        );
         debug!("lookup.2: {}", self.parent);
 
         do_ancestry(
@@ -815,43 +785,33 @@ impl Dhtree {
             self,
             dest,
             is_bootstrap,
-            &self.self_info.as_ref().unwrap(),
+            self.self_info.as_ref().unwrap(),
             self.parent,
         );
 
         debug!("lookup.3");
         for (p, info) in &self.tinfos {
-            do_ancestry(&mut state, self, dest, is_bootstrap, info, p.clone());
+            do_ancestry(&mut state, self, dest, is_bootstrap, info, *p);
         }
 
         debug!("lookup.4");
-        for (p, _) in &self.tinfos {
+        self.tinfos.iter().for_each(|(p, _)| {
             debug!("_dht_lookup {:?}", p);
             let key = &self.peers.get_peer(*p).key;
             if &state.borrow().0/*best*/ == key {
-                do_update(&mut state, key.clone(), p.clone(), None);
+                do_update(&mut state, key.clone(), *p, None);
             }
-        }
+        });
 
         debug!("lookup.5");
-        for (_, info) in &self.dinfos {
+        self.dinfos.iter().for_each(|(_, info)| {
             debug!("_dht_lookup {:?}", info);
             do_dht(&mut state, dest, is_bootstrap, info);
-        }
+        });
 
         debug!("lookup.6");
 
-        let best_peer = if let Some(pid) = state.borrow().1.clone()
-        /*best_peer*/
-        {
-            if pid != PeerId::nil() {
-                Some(pid)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let best_peer = state.borrow().1.filter(|&pid| pid != PeerId::nil());
         let best_peer = if let Some(pid) = best_peer {
             let pid = self.peers.get_peer(pid);
             Some(pid)
@@ -997,8 +957,8 @@ impl Dhtree {
             }
         }
 
-        let mut setup = self._new_setup(&ack.response);
-        self._handle_setup(PeerId::nil(), &mut setup).await;
+        let setup = self._new_setup(&ack.response);
+        self._handle_setup(PeerId::nil(), &setup).await;
         debug!("Dhtree _handle_bootstrap_ack.end");
         Ok(())
     }
@@ -1070,13 +1030,11 @@ impl Dhtree {
         }
         debug!("  _handle_setup.3");
         let dinfo = Arc::new(dinfo);
-        if !self.dht_add(dinfo.clone()) {
-            if prev != PeerId::nil() {
-                self.peers
-                    .get_peer(prev)
-                    .send_teardown(&setup.get_teardown())
-                    .unwrap();
-            }
+        if !self.dht_add(dinfo.clone()) && prev != PeerId::nil() {
+            self.peers
+                .get_peer(prev)
+                .send_teardown(&setup.get_teardown())
+                .unwrap();
         }
         let dinfo_key = dinfo.get_map_key();
 
@@ -1100,45 +1058,43 @@ impl Dhtree {
         }
         if let Some(next) = next {
             next.send_setup(setup).unwrap();
-        } else {
-            if self.next.is_some() {
-                // TODO get this right!
-                //  We need to replace the old next in most cases
-                //  The exceptions are when:
-                //    1. The dinfo's root/seq don't match our current root/seq
-                //    2. The dinfo matches, but so does t.next, and t.next is better
-                //  What happens when the dinfo matches, t.next does not, but t.next is still better?...
-                //  Just doing something for now (replace next) but not sure that's right...
-                let do_update = {
-                    if !dinfo.root.eq(&self.self_info.as_ref().unwrap().root)
-                        || dinfo.root_seq != self.self_info.as_ref().unwrap().seq
-                    {
-                        // The root/seq is bad, so don't update
-                        false
-                    } else if dinfo.key.eq(&self.next.as_ref().unwrap().key) {
-                        // It's an update from the current next
-                        true
-                    } else if dht_ordered(
-                        &self.core.crypto.public_key,
-                        &dinfo.key,
-                        &self.next.as_ref().unwrap().key,
-                    ) {
-                        // It's an update from a better next
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if do_update {
-                    self._teardown(PeerId::nil(), &self.next.as_ref().unwrap().get_teardown())
-                        .await;
-                    self.next = Some(dinfo);
+        } else if self.next.is_some() {
+            // TODO get this right!
+            //  We need to replace the old next in most cases
+            //  The exceptions are when:
+            //    1. The dinfo's root/seq don't match our current root/seq
+            //    2. The dinfo matches, but so does t.next, and t.next is better
+            //  What happens when the dinfo matches, t.next does not, but t.next is still better?...
+            //  Just doing something for now (replace next) but not sure that's right...
+            let do_update = {
+                if !dinfo.root.eq(&self.self_info.as_ref().unwrap().root)
+                    || dinfo.root_seq != self.self_info.as_ref().unwrap().seq
+                {
+                    // The root/seq is bad, so don't update
+                    false
+                } else if dinfo.key.eq(&self.next.as_ref().unwrap().key) {
+                    // It's an update from the current next
+                    true
+                } else if dht_ordered(
+                    &self.core.crypto.public_key,
+                    &dinfo.key,
+                    &self.next.as_ref().unwrap().key,
+                ) {
+                    // It's an update from a better next
+                    true
                 } else {
-                    self._teardown(PeerId::nil(), &dinfo.get_teardown()).await;
+                    false
                 }
-            } else {
+            };
+            if do_update {
+                self._teardown(PeerId::nil(), &self.next.as_ref().unwrap().get_teardown())
+                    .await;
                 self.next = Some(dinfo);
+            } else {
+                self._teardown(PeerId::nil(), &dinfo.get_teardown()).await;
             }
+        } else {
+            self.next = Some(dinfo);
         }
         debug!("--_handle_setup");
     }
@@ -1240,11 +1196,9 @@ impl Dhtree {
             //tokio::spawn(async move {
             pconn.handle_traffic(tr).await;
         //    });
-        } else {
-            if let Some(next) = next {
-                debug!("Dhtree handle_dht_traffic.2");
-                next.send_dht_traffic(tr).unwrap();
-            }
+        } else if let Some(next) = next {
+            debug!("Dhtree handle_dht_traffic.2");
+            next.send_dht_traffic(tr).unwrap();
         }
         debug!("--handle_dht_traffic");
     }
@@ -1253,7 +1207,7 @@ impl Dhtree {
         debug!("++send_traffic");
         if let Some(path) = self.pathfinder.get_path(&tr.dest).await {
             debug!("Path: {:?}", path);
-            if path.len() > 0 {
+            if !path.is_empty() {
                 let pt = PathTraffic {
                     path,
                     dt: tr.clone(),
@@ -1328,8 +1282,8 @@ impl fmt::Display for DhtTraffic {
 
 impl Encode for DhtTraffic {
     fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.source.as_bytes());
-        out.extend_from_slice(&self.dest.as_bytes());
+        out.extend_from_slice(self.source.as_bytes());
+        out.extend_from_slice(self.dest.as_bytes());
         out.push(self.kind);
         out.extend_from_slice(&self.payload);
     }
@@ -1477,19 +1431,19 @@ impl TreeInfo {
         let mut key = self.root.clone();
 
         /*Replace with your actual implementation*/
-        bs.extend_from_slice(&self.root.as_bytes());
+        bs.extend_from_slice(self.root.as_bytes());
 
         let seq = self.seq.to_be_bytes();
         bs.extend_from_slice(&seq);
 
         for hop in &self.hops {
             /*Replace with your actual implementation*/
-            bs.extend_from_slice(&hop.next.as_bytes());
+            bs.extend_from_slice(hop.next.as_bytes());
 
             // Assuming wireEncodeUint is a function to encode the port value to bytes
             bs.extend_from_slice(&hop.port.encode_var_vec());
 
-            if !key.verify(&bs, &hop.sig.as_bytes()) {
+            if !key.verify(&bs, hop.sig.as_bytes()) {
                 return false;
             }
             key = hop.next.clone();
@@ -1513,17 +1467,17 @@ impl TreeInfo {
 
     pub fn add(&self, priv_key: PrivateKeyBytes, next: &Peer) -> TreeInfo {
         let mut bs = Vec::new();
-        bs.extend_from_slice(&self.root.as_bytes());
+        bs.extend_from_slice(self.root.as_bytes());
 
         let seq = self.seq.to_be_bytes();
         bs.extend_from_slice(&seq);
 
         for hop in &self.hops {
-            bs.extend_from_slice(&hop.next.as_bytes());
+            bs.extend_from_slice(hop.next.as_bytes());
             bs.extend_from_slice(&hop.port.encode_var_vec());
         }
 
-        bs.extend_from_slice(&next.key.as_bytes());
+        bs.extend_from_slice(next.key.as_bytes());
         bs.extend_from_slice(&next.port.encode_var_vec());
 
         let sig = priv_key.sign(&bs);
@@ -1724,7 +1678,7 @@ impl DhtSetup {
             return false;
         }
         let bs = self.bytes_for_sig();
-        let res = self.token.source.verify(&bs, &self.sig.as_bytes());
+        let res = self.token.source.verify(&bs, self.sig.as_bytes());
         if !res {
             panic!("DhtSetup verify failed.")
         }
@@ -1767,7 +1721,7 @@ impl DhtSetupToken {
 
     pub fn check(&self) -> bool {
         let bs = self.bytes_for_sig();
-        let res = self.dest.key.verify(&bs, &self.sig.as_bytes()) && self.dest.check();
+        let res = self.dest.key.verify(&bs, self.sig.as_bytes()) && self.dest.check();
         if !res {
             debug!("DhtSetupToken verify failed");
         }
@@ -1831,7 +1785,7 @@ impl TreeLabel {
 
     pub fn check(&self) -> bool {
         let bs = self.bytes_for_sig();
-        if !self.key.verify(&bs, &self.sig.as_bytes()) {
+        if !self.key.verify(&bs, self.sig.as_bytes()) {
             panic!("TreeLabel verify failed.");
         }
         true
@@ -2014,10 +1968,10 @@ pub struct DhtMapKey {
 // Rust equivalent of the treeLess function.
 fn tree_less(key1: &PublicKeyBytes, key2: &PublicKeyBytes) -> bool {
     for (byte1, byte2) in key1.as_bytes().iter().zip(key2.as_bytes()) {
-        if byte1 < byte2 {
-            return true;
-        } else if byte1 > byte2 {
-            return false;
+        match byte1.cmp(byte2) {
+            cmp::Ordering::Less => return true,
+            cmp::Ordering::Greater => return false,
+            cmp::Ordering::Equal => (),
         }
     }
     false

@@ -22,9 +22,9 @@ pub enum Wire {
     PathTraffic,
 }
 
-impl Into<u8> for Wire {
-    fn into(self) -> u8 {
-        self as u8
+impl From<Wire> for u8 {
+    fn from(val: Wire) -> Self {
+        val as u8
     }
 }
 
@@ -91,9 +91,9 @@ impl From<u8> for WireTraffic {
     }
 }
 
-impl Into<u8> for WireTraffic {
-    fn into(self) -> u8 {
-        self as u8
+impl From<WireTraffic> for u8 {
+    fn from(val: WireTraffic) -> Self {
+        val as u8
     }
 }
 

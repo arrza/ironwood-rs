@@ -18,11 +18,7 @@ use std::{
         Arc,
     },
 };
-use tokio::{
-    net::TcpStream,
-    select,
-    sync::{mpsc, Mutex},
-};
+use tokio::{net::TcpStream, select, sync::mpsc};
 
 #[derive(Clone)]
 pub struct PacketConn {
@@ -84,7 +80,7 @@ impl PacketConnRead {
 
 impl std::fmt::Debug for PacketConn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Core: {:?}\n", self.core)
+        writeln!(f, "Core: {:?}", self.core)
     }
 }
 

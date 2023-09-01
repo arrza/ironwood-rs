@@ -50,9 +50,9 @@ impl From<u8> for SessionType {
     }
 }
 
-impl Into<u8> for SessionType {
-    fn into(self) -> u8 {
-        match self {
+impl From<SessionType> for u8 {
+    fn from(val: SessionType) -> Self {
+        match val {
             SessionType::Dummy => 0,
             SessionType::Init => 1,
             SessionType::Ack => 2,
@@ -243,7 +243,7 @@ impl SessionManager {
 
         //        info.reset_timer().await;
         let info = Arc::new(info);
-        self.sessions.insert(ed.clone(), info.clone()).await;
+        self.sessions.insert(*ed, info.clone()).await;
         info
     }
 
@@ -259,7 +259,7 @@ impl SessionManager {
         if info.is_none() {
             debug!("  SessionMnanager::session_for_init.1");
             info = Some(
-                self.new_session(pub_, init.current.clone(), init.next.clone(), init.seq)
+                self.new_session(pub_, init.current, init.next, init.seq)
                     .await,
             );
             if let Some(buffer) = &mut buf {
@@ -267,9 +267,9 @@ impl SessionManager {
                 if let Some(info_arc) = &info {
                     let buffer = buffer.lock().await;
                     let mut info = info_arc.info.lock().unwrap();
-                    info.send_pub = buffer.init.current.clone();
+                    info.send_pub = buffer.init.current;
                     info.send_priv = buffer.current_priv.clone();
-                    info.next_pub = buffer.init.next.clone();
+                    info.next_pub = buffer.init.next;
                     info.next_priv = buffer.next_priv.clone();
                     info.fix_shared(0, 0);
                 }
@@ -303,7 +303,6 @@ impl SessionManager {
             SessionType::Traffic => {
                 self.handle_traffic(pub_, data).await;
             }
-            _ => {}
         }
     }
 
@@ -475,7 +474,8 @@ impl SessionInfo {
         let (next_pub, next_priv) = new_box_keys();
         let recv_shared = get_shared(&current, &recv_priv);
         let send_shared = get_shared(&current, &send_priv);
-        let mut info = SessionInfo {
+
+        SessionInfo {
             mgr,
             ed: *ed,
             info: Arc::new(StdMutex::new(SessionInfoInternal {
@@ -503,9 +503,7 @@ impl SessionInfo {
                 rx: 0,
                 tx: 0,
             })),
-        };
-
-        info
+        }
     }
 
     // happens at session creation or after receiving an init/ack
@@ -639,10 +637,10 @@ impl SessionInfo {
         let from_next;
         let to_recv;
         let to_send;
-        let mut shared_key = [0; 32];
+        let shared_key;
         {
             {
-                let mut info = self.info.lock().unwrap();
+                let info = self.info.lock().unwrap();
                 from_current = remote_key_seq == info.remote_key_seq;
                 from_next = remote_key_seq == info.remote_key_seq + 1;
                 to_recv = local_key_seq + 1 == info.local_key_seq;
@@ -655,17 +653,17 @@ impl SessionInfo {
             //let mut on_success: Box<dyn FnMut(&mut SessionInfo, BoxPub)> = Box::new(|_, _| {});
 
             if from_current && to_recv {
-                let mut info = self.info.lock().unwrap();
-                if !(info.recv_nonce < nonce) {
+                let info = self.info.lock().unwrap();
+                if info.recv_nonce >= nonce {
                     debug!("--do_recv.2");
                     return;
                 }
-                shared_key = info.recv_shared.clone();
+                shared_key = info.recv_shared;
                 // on_success = Box::new(|info: &mut SessionInfo, key: BoxPub| {
                 //     info.recv_nonce = nonce;
                 // });
             } else if from_next && to_send {
-                let mut info = self.info.lock().unwrap();
+                let info = self.info.lock().unwrap();
                 shared_key = get_shared(&info.next, &info.send_priv);
             // on_success = Box::new(|info: &mut SessionInfo, inner_key: BoxPub| {
             //     info.current = info.next;
@@ -682,7 +680,7 @@ impl SessionInfo {
             //     info._fix_shared(nonce, 0);
             // });
             } else if from_next && to_recv {
-                let mut info = self.info.lock().unwrap();
+                let info = self.info.lock().unwrap();
                 shared_key = get_shared(&info.next, &info.recv_priv);
             } else {
                 self._send_init().await;
@@ -694,7 +692,7 @@ impl SessionInfo {
         //let mut unboxed = [0; 65536];
         debug!("Enc Value: {} ,{}\n", msg.len(), org_msg.len());
         let mut unboxed = vec![0u8; msg.len() - BOX_OVERHEAD];
-        if let Ok(_) = box_open(&mut unboxed, msg, nonce, &shared_key) {
+        if box_open(&mut unboxed, msg, nonce, &shared_key).is_ok() {
             debug!("  do_recv.1");
             let key = BoxPub::from_slice(&unboxed[..BOX_PUB_SIZE]).unwrap();
             let msg = &unboxed[BOX_PUB_SIZE..];
@@ -741,7 +739,7 @@ impl SessionInfo {
             let info = self.info.lock().unwrap();
             init = SessionInit::new(&info.send_pub, &info.next_pub, info.local_key_seq);
         }
-        self.mgr.send_init(self.ed.clone(), &init).await;
+        self.mgr.send_init(self.ed, &init).await;
     }
 
     async fn _send_ack(&self) {
@@ -769,8 +767,8 @@ pub struct SessionInit {
 impl SessionInit {
     fn new(current: &BoxPub, next: &BoxPub, key_seq: u64) -> Self {
         Self {
-            current: current.clone(),
-            next: next.clone(),
+            current: *current,
+            next: *next,
             key_seq,
             seq: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -821,9 +819,6 @@ impl SessionInit {
             return Err("Invalid packet len".into());
         }
 
-        let mut key_seq: u64 = 0;
-        let mut seq: u64 = 0;
-
         let mut offset = 1;
         let from_box = BoxPub::from_slice(&data[offset..offset + BOX_PUB_SIZE]).unwrap();
         offset += BOX_PUB_SIZE;
@@ -850,9 +845,9 @@ impl SessionInit {
         let next = BoxPub::from_slice(&payload[offset..offset + BOX_PUB_SIZE]).unwrap();
         offset += BOX_PUB_SIZE;
 
-        key_seq = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+        let key_seq = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
         offset += 8;
-        seq = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
+        let seq = u64::from_be_bytes(payload[offset..offset + 8].try_into().unwrap());
 
         let mut sig_bytes = Vec::new();
         sig_bytes.extend_from_slice(&from_box.0);

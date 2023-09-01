@@ -1,5 +1,4 @@
 use super::{
-    core::Core,
     crypto::{Crypto, PublicKeyBytes},
     dhtree::{
         DhtBootstrap, DhtBootstrapAck, DhtSetup, DhtTeardown, DhtTraffic, DhtreeHandle,
@@ -178,7 +177,7 @@ impl Peers {
             prio: AtomicU8::new(prio),
             ready: true,
             info: Arc::new(Mutex::new(None)),
-            id: id.clone(),
+            id,
             write_queue: wq_tx,
         };
         let peer = Arc::new(peer);
@@ -295,7 +294,7 @@ impl PeerConnection {
         let prio = self.peer.prio.load(atomic::Ordering::SeqCst);
         if prio > 0 {
             // Write to stream
-            conn_tx.write_all(&[0x00, 0x03, 'p' as u8, prio]).await?;
+            conn_tx.write_all(&[0x00, 0x03, b'p', prio]).await?;
         }
 
         let mut len_buf = [0; 2];
@@ -406,15 +405,13 @@ impl Peer {
         if bs.len() < 2 {
             return Ok(());
         }
-        match bs[0] {
-            b'p' => {
-                let prio = bs[1];
-                if prio > self.prio.load(atomic::Ordering::SeqCst) {
-                    self.prio.store(prio, atomic::Ordering::SeqCst);
-                }
+        if bs[0] == b'p' {
+            let prio = bs[1];
+            if prio > self.prio.load(atomic::Ordering::SeqCst) {
+                self.prio.store(prio, atomic::Ordering::SeqCst);
             }
-            _ => {}
         }
+
         Ok(())
     }
 

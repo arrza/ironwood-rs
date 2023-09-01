@@ -7,7 +7,7 @@ use crate::{
     types::PeerPort,
 };
 use integer_encoding::{VarInt, VarIntReader};
-use log::debug;
+use log::{debug, error};
 use std::{
     collections::HashMap,
     fmt,
@@ -64,7 +64,7 @@ impl PathfinderHandle {
         let info;
         {
             let mut paths = self.paths.lock().await;
-            if let Some(_info) = paths.get_mut(&dest) {
+            if let Some(_info) = paths.get_mut(dest) {
                 // if the path exists, stop the previous timer
                 //info.timer_handle.take().map(|handle| handle.abort());
             } else {
@@ -77,7 +77,7 @@ impl PathfinderHandle {
                 paths.insert(dest.clone(), info);
             }
 
-            info = paths.get(&dest).cloned().unwrap();
+            info = paths.get(dest).cloned().unwrap();
         }
         // let dest_clone = dest.clone();
 
@@ -116,7 +116,7 @@ impl PathfinderHandle {
             rpath: Vec::new(),
         };
         r.path.push(0);
-        return Some(r);
+        Some(r)
     }
 
     async fn get_lookup(&self, n: &PathNotify) -> Option<PathLookup> {
@@ -212,7 +212,7 @@ impl Pathfinder {
         let dhtree = self.dhtree.clone();
         let mut paths = self.paths.lock().await;
         debug!("  get_notify. lock");
-        if let Some(info) = paths.get_mut(&dest) {
+        if let Some(info) = paths.get_mut(dest) {
             if info.ntime.elapsed() > throttle {
                 let mut n = PathNotify {
                     sig: SignatureBytes::default(),
@@ -300,7 +300,7 @@ impl fmt::Display for PathTraffic {
 
 impl Encode for PathTraffic {
     fn encode(&self, out: &mut Vec<u8>) {
-        let mut path = self.path.clone();
+        let path = self.path.clone();
         debug!("Path: {:?}", path);
         // if path.last().is_none() || path.last().unwrap() != &0 {
         //     path.push(0);
@@ -349,15 +349,15 @@ impl PathNotify {
             None => false,
             Some(label) => {
                 if !label.check() {
-                    debug!("Invalid label");
+                    error!("Invalid label");
                     return false;
                 }
                 let mut bs = Vec::new();
                 bs.extend_from_slice(self.dest.as_bytes());
                 label.encode(&mut bs);
                 let dest = label.key.clone();
-                if !dest.verify(&bs, &self.sig.as_bytes()) {
-                    panic!("Invalid Notify");
+                if !dest.verify(&bs, self.sig.as_bytes()) {
+                    error!("Invalid Notify");
                     return false;
                 }
                 true

@@ -47,16 +47,15 @@ impl From<PublicKey> for Addr {
         Addr(PublicKeyBytes(pk.to_bytes()))
     }
 }
-impl Into<PublicKeyBytes> for Addr {
-    fn into(self) -> PublicKeyBytes {
-        self.0
+
+impl From<Addr> for PublicKeyBytes {
+    fn from(val: Addr) -> Self {
+        val.0
     }
 }
 
 #[derive(Debug)]
-enum IrwdError {
-    
-}
+enum IrwdError {}
 
 impl fmt::Display for IrwdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
