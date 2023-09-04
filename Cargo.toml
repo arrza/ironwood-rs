@@ -19,3 +19,5 @@ sha2 = "0.10.6"
 futures = "0.3.28"
 log = "0.4.18"
 rand_07 = { package = "rand", version = "0.7.3" }
+serde = { version = "1.0.188", features = ["serde_derive"] }
+humantime-serde = "1.1.1"

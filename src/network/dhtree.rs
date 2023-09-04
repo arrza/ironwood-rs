@@ -10,6 +10,7 @@ use byteorder::{BigEndian, ReadBytesExt};
 use futures::{future::BoxFuture, FutureExt};
 use integer_encoding::{VarInt, VarIntReader};
 use log::{debug, error};
+use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     cmp,
@@ -17,7 +18,7 @@ use std::{
     fmt::{self},
     io::{Cursor, Read},
     sync::{atomic, Arc},
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,23 +27,25 @@ pub const TREE_TIMEOUT: Duration = Duration::from_secs(TREE_TIMEOUT_SECS); // TO
 pub const TREE_ANNOUNCE: Duration = Duration::from_secs(TREE_TIMEOUT_SECS / 2);
 pub const TREE_THROTTLE: Duration = Duration::from_secs(TREE_TIMEOUT_SECS / 4); // TODO: use this to limit how fast seqs can update
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(1);
-#[derive(Debug)]
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DebugSelfInfo {
-    key: PublicKeyBytes,
-    root: PublicKeyBytes,
-    coords: Vec<u64>,
-    updated: Instant,
+    pub key: PublicKeyBytes,
+    pub root: PublicKeyBytes,
+    pub coords: Vec<u64>,
+    #[serde(with = "humantime_serde")]
+    updated: SystemTime,
 }
 
 #[derive(Debug)]
-struct DebugPeerInfo {
-    key: PublicKeyBytes,
-    root: PublicKeyBytes,
-    coords: Vec<u64>,
-    port: u64,
-    updated: PublicKeyBytes,
-    //conn: Option<TcpStream>,
-    priority: u8,
+pub struct DebugPeerInfo {
+    pub key: PublicKeyBytes,
+    pub root: PublicKeyBytes,
+    pub coords: Vec<u64>,
+    pub port: u64,
+    pub updated: SystemTime,
+    pub priority: u8,
+    pub remote_addr: String,
 }
 
 #[derive(Debug)]
@@ -103,6 +106,7 @@ pub enum DhtreeMessages {
     PeersMessages(PeersMessages),
     DebugGetDht(oneshot::Sender<Vec<DebugDHTInfo>>),
     DebugGetSelf(oneshot::Sender<DebugSelfInfo>),
+    DebugGetPeers(oneshot::Sender<Vec<DebugPeerInfo>>),
 }
 
 #[derive(Clone, Debug)]
@@ -210,12 +214,18 @@ impl DhtreeHandle {
         self.queue.send(DhtreeMessages::DebugGetDht(tx)).unwrap();
         rx.await.unwrap()
     }
+
+    pub async fn get_peers(&self) -> Vec<DebugPeerInfo> {
+        let (tx, rx) = oneshot::channel();
+        self.queue.send(DhtreeMessages::DebugGetPeers(tx)).unwrap();
+        rx.await.unwrap()
+    }
 }
 
 #[derive(Debug)]
 pub struct TreeExpiredInfo {
     seq: u64,
-    time: std::time::Instant, // Rust equivalent of time.Time in Go
+    time: SystemTime, // Rust equivalent of time.Time in Go
 }
 
 #[derive(Debug)]
@@ -383,9 +393,26 @@ impl Dhtree {
                         key: self.core.crypto.public_key.clone(),
                         root: self.self_info.as_ref().unwrap().root.clone(),
                         coords,
-                        updated: self.self_info.as_ref().unwrap().time,
+                        updated: self.self_info.as_ref().unwrap().time.into(),
                     };
                     tx.send(info).unwrap();
+                }
+                DhtreeMessages::DebugGetPeers(tx) => {
+                    let mut infos = Vec::new();
+                    for (id, tinfo) in self.tinfos.iter() {
+                        let peer = self.peers.get_peer(*id);
+                        let info = DebugPeerInfo {
+                            key: peer.key.clone(),
+                            root: tinfo.root.clone(),
+                            coords: tinfo.hops.iter().map(|h| h.port).collect(),
+                            port: peer.port,
+                            updated: tinfo.time,
+                            priority: peer.prio.load(atomic::Ordering::Relaxed),
+                            remote_addr: peer.remote_addr.clone(),
+                        };
+                        infos.push(info);
+                    }
+                    tx.send(infos).unwrap();
                 }
                 DhtreeMessages::PeersMessages(msg) => match msg {
                     PeersMessages::HandlePathTraffic(tr) => {
@@ -427,7 +454,7 @@ impl Dhtree {
     async fn _update(&mut self, mut info: TreeInfo, p: PeerId) {
         debug!("Dhtree update.");
         // The tree info should have been checked before this point
-        info.time = Instant::now(); // Order by processing time, not receiving time...
+        info.time = SystemTime::now(); // Order by processing time, not receiving time...
         self.hseq += 1;
         info.hseq = self.hseq; // Used to track order without comparing timestamps, since some platforms have *horrible* time resolution
 
@@ -546,7 +573,7 @@ impl Dhtree {
             self.self_info = Some(TreeInfo {
                 root: self.core.crypto.public_key.clone(),
                 seq: UNIX_EPOCH.elapsed().unwrap().as_secs(),
-                time: Instant::now(),
+                time: SystemTime::now(),
                 hseq: 0,
                 hops: Vec::new(),
             });
@@ -579,7 +606,8 @@ impl Dhtree {
 
         for (p, info) in tinfos.iter() {
             if let Some(exp) = self.expired.get(&info.root) {
-                if info.seq < exp.seq || (info.seq == exp.seq && exp.time.elapsed() > TREE_TIMEOUT)
+                if info.seq < exp.seq
+                    || (info.seq == exp.seq && exp.time.elapsed().unwrap() > TREE_TIMEOUT)
                 {
                     continue; // skip old sequence numbers
                 }
@@ -623,7 +651,7 @@ impl Dhtree {
                     .unwrap()
                     .time
                     + TREE_TIMEOUT;
-                stop_time.duration_since(Instant::now())
+                stop_time.duration_since(SystemTime::now()).unwrap()
             };
             let self_clone = self.self_info.clone();
             let handle = self.handle();
@@ -1318,7 +1346,7 @@ impl Decode for DhtTraffic {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TreeInfo {
-    pub time: std::time::Instant, // This field is not serialized
+    pub time: SystemTime, // This field is not serialized
     pub hseq: u64,
     pub root: PublicKeyBytes,
     pub seq: u64,
@@ -1362,7 +1390,7 @@ impl Decode for TreeInfo {
     fn decode(data: &[u8]) -> Result<Self, WireDecodeError> {
         let mut cursor = Cursor::new(data);
 
-        let time = std::time::Instant::now(); // This field is not deserialized, use current time
+        let time = SystemTime::now(); // This field is not deserialized, use current time
         let mut root = [0u8; PUBLIC_KEY_SIZE];
         cursor.read_exact(&mut root).map_err(|_| WireDecodeError)?;
         let seq = cursor
@@ -1398,7 +1426,7 @@ impl Decode for TreeInfo {
 impl TreeInfo {
     pub fn new(root: PublicKeyBytes) -> Self {
         TreeInfo {
-            time: Instant::now(),
+            time: SystemTime::now(),
             hseq: 0,
             root,
             seq: 0,

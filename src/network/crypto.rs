@@ -1,14 +1,13 @@
-use core::fmt;
-
-use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
-
 use crate::types::Addr;
+use core::fmt;
+use ed25519_dalek::{Keypair, PublicKey, SecretKey, Signature, Signer, Verifier};
+use serde::{Deserialize, Serialize};
 
 pub const PUBLIC_KEY_SIZE: usize = 32;
 pub const PRIVATE_KEY_SIZE: usize = 64;
 pub const SIGNATURE_SIZE: usize = 64;
 
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct PublicKeyBytes(pub [u8; PUBLIC_KEY_SIZE]);
 
 impl fmt::Debug for PublicKeyBytes {

@@ -176,6 +176,7 @@ impl Peers {
             port: idx,
             prio: AtomicU8::new(prio),
             ready: true,
+            remote_addr: conn.peer_addr().unwrap().to_string(),
             info: Arc::new(Mutex::new(None)),
             id,
             write_queue: wq_tx,
@@ -349,10 +350,11 @@ pub struct Peer {
     pub id: PeerId,
     peers: PeersHandle,
     pub key: PublicKeyBytes,
-    info: Arc<Mutex<Option<TreeInfo>>>,
+    pub info: Arc<Mutex<Option<TreeInfo>>>,
     pub port: PeerPort,
     ready: bool,
     pub prio: AtomicU8,
+    pub remote_addr: String,
     write_queue: mpsc::UnboundedSender<Vec<u8>>,
 }
 
