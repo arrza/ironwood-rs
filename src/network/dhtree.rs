@@ -800,12 +800,20 @@ impl Dhtree {
         let mut state = (self.core.crypto.public_key.clone(), None, None);
 
         debug!("lookup.1 {}", dest);
-        do_update(
-            &mut state,
-            self.self_info.as_ref().unwrap().root.clone(),
-            self.parent,
-            None,
-        );
+        if (is_bootstrap && state.borrow().0/*best*/ == *dest)
+            || dht_ordered(
+                &self.self_info.as_ref().unwrap().root,
+                dest,
+                &state.borrow().0,
+            )
+        {
+            do_update(
+                &mut state,
+                self.self_info.as_ref().unwrap().root.clone(),
+                self.parent,
+                None,
+            );
+        }
         debug!("lookup.2: {}", self.parent);
 
         do_ancestry(
