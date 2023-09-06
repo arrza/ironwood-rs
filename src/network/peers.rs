@@ -7,7 +7,7 @@ use super::{
     pathfinder::{PathLookup, PathNotify, PathResponse, PathTraffic, PathfinderHandle},
     wire::{Decode, Encode, Wire},
 };
-use crate::types::PeerPort;
+use crate::types::{Conn, PeerPort};
 use log::debug;
 use std::{
     collections::HashMap,
@@ -23,7 +23,6 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
     select,
     sync::{mpsc, oneshot},
     time::timeout,
@@ -39,7 +38,7 @@ pub enum PeersMessages {
     GetPeer(PeerId, oneshot::Sender<Arc<Peer>>),
     AddPeer(
         PublicKeyBytes,
-        TcpStream,
+        Box<dyn Conn>,
         u8,
         oneshot::Sender<Result<(Arc<Peer>, PeerConnection), String>>,
     ),
@@ -98,7 +97,7 @@ impl PeersHandle {
     pub async fn add_peer(
         &self,
         key: PublicKeyBytes,
-        conn: TcpStream,
+        conn: Box<dyn Conn>,
         prio: u8,
     ) -> Result<(Arc<Peer>, PeerConnection), String> {
         let (tx, rx) = oneshot::channel();
@@ -154,7 +153,7 @@ impl Peers {
     pub fn add_peer(
         &mut self,
         key: PublicKeyBytes,
-        conn: TcpStream,
+        conn: Box<dyn Conn>,
         prio: u8,
     ) -> Result<(Arc<Peer>, PeerConnection), Box<dyn Error>> {
         let mut idx = self.peers.len() as u64;
@@ -277,7 +276,7 @@ impl fmt::Display for PeerId {
 #[derive(Debug)]
 pub struct PeerConnection {
     id: PeerId,
-    conn: TcpStream,
+    conn: Box<dyn Conn>,
     peer: Arc<Peer>,
     write_queue: mpsc::UnboundedReceiver<Vec<u8>>,
 }
@@ -291,7 +290,7 @@ impl PeerConnection {
         println!("Sending Tree");
         self.peer
             .send_tree(&TreeInfo::new(self.peer.peers.crypto.public_key.clone()))?;
-        let (mut conn_rx, mut conn_tx) = self.conn.split();
+        let (mut conn_rx, mut conn_tx) = self.conn.split(); //elf.conn.split();
         let prio = self.peer.prio.load(atomic::Ordering::SeqCst);
         if prio > 0 {
             // Write to stream

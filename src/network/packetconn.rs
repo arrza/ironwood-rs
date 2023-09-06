@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     network::crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
-    types::Addr,
+    types::{Addr, Conn},
 };
 use ed25519_dalek::SecretKey;
 use log::debug;
@@ -18,7 +18,7 @@ use std::{
         Arc,
     },
 };
-use tokio::{net::TcpStream, select, sync::mpsc};
+use tokio::{select, sync::mpsc};
 
 #[derive(Clone)]
 pub struct PacketConn {
@@ -151,7 +151,7 @@ impl PacketConn {
     pub async fn handle_conn(
         &self,
         key: PublicKeyBytes,
-        conn: TcpStream,
+        conn: Box<dyn Conn>,
         prio: u8,
     ) -> Result<(), Box<dyn Error>> {
         let pk = key;
