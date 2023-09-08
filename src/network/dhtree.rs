@@ -50,15 +50,15 @@ pub struct DebugPeerInfo {
 
 #[derive(Debug)]
 pub struct DebugDHTInfo {
-    key: PublicKeyBytes,
-    port: u64,
-    rest: u64,
+    pub key: PublicKeyBytes,
+    pub port: u64,
+    pub rest: u64,
 }
 
 #[derive(Debug)]
-struct DebugPathInfo {
-    key: PublicKeyBytes,
-    path: Vec<u64>,
+pub struct DebugPathInfo {
+    pub key: PublicKeyBytes,
+    pub path: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -107,6 +107,7 @@ pub enum DhtreeMessages {
     DebugGetDht(oneshot::Sender<Vec<DebugDHTInfo>>),
     DebugGetSelf(oneshot::Sender<DebugSelfInfo>),
     DebugGetPeers(oneshot::Sender<Vec<DebugPeerInfo>>),
+    DebugGetPaths(oneshot::Sender<Vec<DebugPathInfo>>),
 }
 
 #[derive(Clone, Debug)]
@@ -218,6 +219,12 @@ impl DhtreeHandle {
     pub async fn get_peers(&self) -> Vec<DebugPeerInfo> {
         let (tx, rx) = oneshot::channel();
         self.queue.send(DhtreeMessages::DebugGetPeers(tx)).unwrap();
+        rx.await.unwrap()
+    }
+
+    pub async fn get_paths(&self) -> Vec<DebugPathInfo> {
+        let (tx, rx) = oneshot::channel();
+        self.queue.send(DhtreeMessages::DebugGetPaths(tx)).unwrap();
         rx.await.unwrap()
     }
 }
@@ -413,6 +420,17 @@ impl Dhtree {
                         infos.push(info);
                     }
                     tx.send(infos).unwrap();
+                }
+                DhtreeMessages::DebugGetPaths(tx) => {
+                    let mut paths = Vec::new();
+                    for (key, path) in self.pathfinder.get_paths().iter() {
+                        let info = DebugPathInfo {
+                            key: key.clone(),
+                            path: path.path.clone(),
+                        };
+                        paths.push(info);
+                    }
+                    tx.send(paths).unwrap();
                 }
                 DhtreeMessages::PeersMessages(msg) => match msg {
                     PeersMessages::HandlePathTraffic(tr) => {

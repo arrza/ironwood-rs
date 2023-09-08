@@ -1,3 +1,4 @@
+use super::{core::Core, crypto::Crypto, dhtree::DhtreeHandle, peers::PeerId};
 use crate::{
     network::{
         crypto::{PublicKeyBytes, SignatureBytes, PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
@@ -12,12 +13,10 @@ use std::{
     collections::HashMap,
     fmt,
     io::{Cursor, Read},
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, Mutex};
-
-use super::{core::Core, crypto::Crypto, dhtree::DhtreeHandle, peers::PeerId};
+use tokio::sync::mpsc;
 
 const PATHFINDER_TIMEOUT: Duration = Duration::from_secs(60);
 const PATHFINDER_THROTTLE: Duration = Duration::from_secs(1);
@@ -26,7 +25,7 @@ const PATHFINDER_THROTTLE: Duration = Duration::from_secs(1);
 pub struct PathInfo {
     ltime: Instant,
     ntime: Instant,
-    path: Vec<PeerPort>,
+    pub path: Vec<PeerPort>,
 }
 
 #[derive(Debug)]
@@ -60,10 +59,13 @@ pub struct PathfinderQueue {
 }
 
 impl PathfinderHandle {
+    pub fn get_paths(&self) -> MutexGuard<HashMap<PublicKeyBytes, PathInfo>> {
+        self.paths.lock().unwrap()
+    }
     pub async fn get_path(&self, dest: &PublicKeyBytes) -> Option<Vec<PeerPort>> {
         let info;
         {
-            let mut paths = self.paths.lock().await;
+            let mut paths = self.paths.lock().unwrap();
             if let Some(_info) = paths.get_mut(dest) {
                 // if the path exists, stop the previous timer
                 //info.timer_handle.take().map(|handle| handle.abort());
@@ -120,7 +122,7 @@ impl PathfinderHandle {
     }
 
     async fn get_lookup(&self, n: &PathNotify) -> Option<PathLookup> {
-        let mut paths = self.paths.lock().await;
+        let mut paths = self.paths.lock().unwrap();
         if let Some(info) = paths.get_mut(&n.label.as_ref().unwrap().key) {
             if info.ltime.elapsed() < PATHFINDER_THROTTLE || !n.check() {
                 return None;
@@ -138,7 +140,7 @@ impl PathfinderHandle {
     pub async fn handle_response(&self, r: &PathResponse) {
         debug!("++handle_response.");
         // Note: this only handles the case where there's no valid next hop in the path
-        let mut paths = self.paths.lock().await;
+        let mut paths = self.paths.lock().unwrap();
         if let Some(info) = paths.get_mut(&r.from) {
             // Reverse r.rpath and save it to info.path
             info.path.clear();
@@ -210,14 +212,28 @@ impl Pathfinder {
         };
 
         let dhtree = self.dhtree.clone();
-        let mut paths = self.paths.lock().await;
+        let mut need_label = false;
+        {
+            let mut paths = self.paths.lock().unwrap();
+            if let Some(info) = paths.get_mut(dest) {
+                if info.ntime.elapsed() > throttle {
+                    need_label = true;
+                }
+            }
+        }
+        let label = if need_label {
+            Some(dhtree.get_label().await)
+        } else {
+            None
+        };
+        let mut paths = self.paths.lock().unwrap();
         debug!("  get_notify. lock");
         if let Some(info) = paths.get_mut(dest) {
             if info.ntime.elapsed() > throttle {
                 let mut n = PathNotify {
                     sig: SignatureBytes::default(),
                     dest: dest.clone(),
-                    label: Some(dhtree.get_label().await),
+                    label,
                 };
                 debug!("  get_notify. path not");
 
