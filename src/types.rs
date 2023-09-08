@@ -4,6 +4,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
 };
+use tokio_native_tls::TlsStream;
 
 use crate::network::crypto::PublicKeyBytes;
 
@@ -93,6 +94,37 @@ impl Conn for TcpStream {
 
     fn local_addr(&self) -> Result<String, IrwdError> {
         Ok(self
+            .local_addr()
+            .map_err(|_| IrwdError::Network)?
+            .to_string())
+    }
+    fn split(
+        self: Box<Self>,
+    ) -> (
+        Box<dyn AsyncRead + Unpin + Send + Sync>,
+        Box<dyn AsyncWrite + Unpin + Send + Sync>,
+    ) {
+        let (r, w) = tokio::io::split(self);
+        (Box::new(r), Box::new(w))
+    }
+}
+
+impl Conn for TlsStream<TcpStream> {
+    fn peer_addr(&self) -> Result<String, IrwdError> {
+        Ok(self
+            .get_ref()
+            .get_ref()
+            .get_ref()
+            .peer_addr()
+            .map_err(|_| IrwdError::Network)?
+            .to_string())
+    }
+
+    fn local_addr(&self) -> Result<String, IrwdError> {
+        Ok(self
+            .get_ref()
+            .get_ref()
+            .get_ref()
             .local_addr()
             .map_err(|_| IrwdError::Network)?
             .to_string())
