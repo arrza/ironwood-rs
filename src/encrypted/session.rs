@@ -11,6 +11,7 @@ use crate::{
     types::{self, Addr},
 };
 use bytes::{BufMut, BytesMut};
+use ed25519_dalek::PublicKey;
 use integer_encoding::{VarInt, VarIntReader};
 use log::debug;
 use std::{
@@ -18,10 +19,10 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter},
     io::Cursor,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SESSION_TRAFFIC_OVERHEAD_MIN: usize = 1 + 1 + 1 + 1 + BOX_OVERHEAD + BOX_PUB_SIZE;
@@ -93,7 +94,7 @@ impl Sessions {
     }
 
     async fn get(&self, key: &EdPub) -> Option<Arc<SessionInfo>> {
-        let mut sessions = self.sessions.lock().await;
+        let mut sessions = self.sessions.lock().unwrap();
         if let Some(info) = sessions.get(key) {
             if info.info.lock().unwrap().timer.elapsed() >= SESSION_TIMEOUT {
                 sessions.remove(key);
@@ -106,8 +107,8 @@ impl Sessions {
         }
     }
 
-    async fn insert(&self, key: EdPub, info: Arc<SessionInfo>) {
-        self.sessions.lock().await.insert(key, info);
+    fn insert(&self, key: EdPub, info: Arc<SessionInfo>) {
+        self.sessions.lock().unwrap().insert(key, info);
     }
 }
 
@@ -146,6 +147,13 @@ impl SessionManagerNoQueue {
     }
 }
 
+pub struct DebugSessionInfo {
+    pub key: PublicKey,
+    pub uptime: Duration,
+    pub rx: u64,
+    pub tx: u64,
+}
+
 #[derive(Clone)]
 pub struct SessionManagerHandle {
     sessions: Sessions,
@@ -172,6 +180,21 @@ impl SessionManagerHandle {
         self.queue
             .send(SessionManagerMessages::HandleData(pub_, data.to_vec()))
             .await;
+    }
+
+    pub fn get_sessions(&self) -> Vec<DebugSessionInfo> {
+        let mut res = Vec::new();
+        let sessions = self.sessions.sessions.lock().unwrap();
+        for (key, info) in sessions.iter() {
+            let info = info.info.lock().unwrap();
+            res.push(DebugSessionInfo {
+                key: PublicKey::from_bytes(&key.0).unwrap(),
+                uptime: info.since.elapsed(),
+                rx: info.rx,
+                tx: info.tx,
+            });
+        }
+        res
     }
 }
 
@@ -232,18 +255,12 @@ impl SessionManager {
         debug!("--SessionManager: handler.end");
     }
 
-    async fn new_session(
-        &self,
-        ed: &EdPub,
-        recv: BoxPub,
-        send: BoxPub,
-        seq: u64,
-    ) -> Arc<SessionInfo> {
+    fn new_session(&self, ed: &EdPub, recv: BoxPub, send: BoxPub, seq: u64) -> Arc<SessionInfo> {
         let info = SessionInfo::new(self.no_queue(), ed, recv, send, seq);
 
         //        info.reset_timer().await;
         let info = Arc::new(info);
-        self.sessions.insert(*ed, info.clone()).await;
+        self.sessions.insert(*ed, info.clone());
         info
     }
 
@@ -254,18 +271,15 @@ impl SessionManager {
     ) -> (Arc<SessionInfo>, Option<Arc<Mutex<SessionBuffer>>>) {
         debug!("++SessionMnanager::session_for_init.");
         let mut info = self.sessions.get(pub_).await;
-        let mut buf = self.buffers.lock().await.get(pub_).cloned();
+        let mut buf = self.buffers.lock().unwrap().get(pub_).cloned();
 
         if info.is_none() {
             debug!("  SessionMnanager::session_for_init.1");
-            info = Some(
-                self.new_session(pub_, init.current, init.next, init.seq)
-                    .await,
-            );
+            info = Some(self.new_session(pub_, init.current, init.next, init.seq));
             if let Some(buffer) = &mut buf {
-                self.buffers.lock().await.remove(pub_);
+                self.buffers.lock().unwrap().remove(pub_);
                 if let Some(info_arc) = &info {
-                    let buffer = buffer.lock().await;
+                    let buffer = buffer.lock().unwrap();
                     let mut info = info_arc.info.lock().unwrap();
                     info.send_pub = buffer.init.current;
                     info.send_priv = buffer.current_priv.clone();
@@ -312,9 +326,13 @@ impl SessionManager {
         {
             info.handle_init(init).await;
             if let Some(buffer) = buf {
-                let buffer = buffer.lock().await;
-                if !buffer.data.is_empty() {
-                    info.do_send(&buffer.data).await;
+                let data;
+                {
+                    let buffer = buffer.lock().unwrap();
+                    data = buffer.data.clone();
+                }
+                if !data.is_empty() {
+                    info.do_send(data.as_ref()).await;
                 }
             }
         }
@@ -335,10 +353,14 @@ impl SessionManager {
             }
             if let Some(buffer) = buf {
                 debug!("  SessionManager::handle_ack.3");
-                let buffer = buffer.lock().await;
-                if !buffer.data.is_empty() {
+                let data;
+                {
+                    let buffer = buffer.lock().unwrap();
+                    data = buffer.data.clone();
+                }
+                if !data.is_empty() {
                     debug!("  SessionManager::handle_ack.4");
-                    info.do_send(&buffer.data).await;
+                    info.do_send(data.as_ref()).await;
                 }
             }
         }
@@ -382,21 +404,24 @@ impl SessionManager {
 
     async fn buffer_and_init(&self, to_key: EdPub, msg: Vec<u8>) -> Result<(), Box<dyn Error>> {
         debug!("++buffer_and_init");
-        let mut buffers = self.buffers.lock().await;
-        let buf = buffers.entry(to_key).or_insert_with(|| {
-            let (current_pub, current_priv) = new_box_keys();
-            let (next_pub, next_priv) = new_box_keys();
-            let init = SessionInit::new(&current_pub, &next_pub, 0);
-            Arc::new(Mutex::new(SessionBuffer {
-                init,
-                current_priv,
-                next_priv,
-                data: Vec::new(),
-            }))
-        });
-        buf.lock().await.data = msg.to_vec();
-
-        self.send_init(to_key, &buf.lock().await.init).await;
+        let init;
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            let buf = buffers.entry(to_key).or_insert_with(|| {
+                let (current_pub, current_priv) = new_box_keys();
+                let (next_pub, next_priv) = new_box_keys();
+                let init = SessionInit::new(&current_pub, &next_pub, 0);
+                Arc::new(Mutex::new(SessionBuffer {
+                    init: Arc::new(init),
+                    current_priv,
+                    next_priv,
+                    data: Arc::new(Vec::new()),
+                }))
+            });
+            buf.lock().unwrap().data = Arc::new(msg.to_vec());
+            init = buf.lock().unwrap().init.clone();
+        }
+        self.send_init(to_key, init.as_ref()).await;
         debug!("--buffer_and_init");
         Ok(())
     }
@@ -458,7 +483,7 @@ impl SessionInfoInternal {
 pub struct SessionInfo {
     pub mgr: SessionManagerNoQueue,
     pub ed: EdPub, // remote ed key
-    info: Arc<StdMutex<SessionInfoInternal>>,
+    info: Arc<Mutex<SessionInfoInternal>>,
 }
 
 impl SessionInfo {
@@ -478,7 +503,7 @@ impl SessionInfo {
         SessionInfo {
             mgr,
             ed: *ed,
-            info: Arc::new(StdMutex::new(SessionInfoInternal {
+            info: Arc::new(Mutex::new(SessionInfoInternal {
                 seq: seq - 1, // so the first update works
 
                 current,
@@ -885,8 +910,8 @@ impl SessionAck {
  * sessionBuffer *
  *****************/
 struct SessionBuffer {
-    data: Vec<u8>,
-    init: SessionInit,
+    data: Arc<Vec<u8>>,
+    init: Arc<SessionInit>,
     current_priv: BoxPriv, // pairs with init.recv
     next_priv: BoxPriv,    // pairs with init.send
 }
