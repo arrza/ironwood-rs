@@ -71,6 +71,13 @@ impl fmt::Display for IrwdError {
 }
 impl Error for IrwdError {}
 
+pub type CloseChannelRx = tokio::sync::mpsc::Receiver<()>;
+pub type CloseChannelTx = tokio::sync::mpsc::Sender<()>;
+
+pub fn close_channel() -> (CloseChannelTx, CloseChannelRx) {
+    tokio::sync::mpsc::channel(1)
+}
+
 pub trait Conn:
     AsyncRead + AsyncWrite + std::marker::Unpin + Send + Sync + std::fmt::Debug
 {

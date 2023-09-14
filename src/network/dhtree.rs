@@ -357,11 +357,9 @@ impl Dhtree {
                 }
                 DhtreeMessages::DoTimeHandleSetup(dinfo_key) => {
                     if let Some(info) = self.dinfos.get(&dinfo_key) {
-                        self.peers
-                            .get_peer(info.peer)
-                            .send_teardown(&info.get_teardown())
-                            .unwrap();
-
+                        if let Some(p) = self.peers.get_peer(info.peer) {
+                            p.send_teardown(&info.get_teardown()).unwrap()
+                        }
                         self.handle.teardown(info.peer, info.get_teardown());
                     }
                 }
@@ -375,12 +373,14 @@ impl Dhtree {
                             rest: 0,
                         };
                         if !dinfo.peer.is_nil() {
-                            let peer = self.peers.get_peer(dinfo.peer);
-                            info.port = peer.port;
+                            if let Some(peer) = self.peers.get_peer(dinfo.peer) {
+                                info.port = peer.port;
+                            }
                         }
                         if !dinfo.rest.is_nil() {
-                            let rest = self.peers.get_peer(dinfo.rest);
-                            info.rest = rest.port;
+                            if let Some(rest) = self.peers.get_peer(dinfo.rest) {
+                                info.rest = rest.port;
+                            }
                         }
                         infos.push(info);
                     }
@@ -400,24 +400,25 @@ impl Dhtree {
                         key: self.core.crypto.public_key.clone(),
                         root: self.self_info.as_ref().unwrap().root.clone(),
                         coords,
-                        updated: self.self_info.as_ref().unwrap().time.into(),
+                        updated: self.self_info.as_ref().unwrap().time,
                     };
                     tx.send(info).unwrap();
                 }
                 DhtreeMessages::DebugGetPeers(tx) => {
                     let mut infos = Vec::new();
                     for (id, tinfo) in self.tinfos.iter() {
-                        let peer = self.peers.get_peer(*id);
-                        let info = DebugPeerInfo {
-                            key: peer.key.clone(),
-                            root: tinfo.root.clone(),
-                            coords: tinfo.hops.iter().map(|h| h.port).collect(),
-                            port: peer.port,
-                            updated: tinfo.time,
-                            priority: peer.prio.load(atomic::Ordering::Relaxed),
-                            remote_addr: peer.remote_addr.clone(),
-                        };
-                        infos.push(info);
+                        if let Some(peer) = self.peers.get_peer(*id) {
+                            let info = DebugPeerInfo {
+                                key: peer.key.clone(),
+                                root: tinfo.root.clone(),
+                                coords: tinfo.hops.iter().map(|h| h.port).collect(),
+                                port: peer.port,
+                                updated: tinfo.time,
+                                priority: peer.prio.load(atomic::Ordering::Relaxed),
+                                remote_addr: peer.remote_addr.clone(),
+                            };
+                            infos.push(info);
+                        }
                     }
                     tx.send(infos).unwrap();
                 }
@@ -458,8 +459,9 @@ impl Dhtree {
 
     async fn _send_tree(&self) {
         for pid in self.tinfos.keys() {
-            let p = self.peers.get_peer(*pid);
-            p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+            if let Some(p) = self.peers.get_peer(*pid) {
+                p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+            }
         }
     }
 
@@ -497,59 +499,59 @@ impl Dhtree {
         }
 
         debug!("Dhtree update.1");
-        let p = self.peers.get_peer(p);
-        if !self.tinfos.contains_key(&p.id) {
-            // The peer may have missed an update due to a race between creating the peer and now
-            // The easiest way to fix the problem is to just send it another update right now
-            p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+        if let Some(p) = self.peers.get_peer(p) {
+            if !self.tinfos.contains_key(&p.id) {
+                // The peer may have missed an update due to a race between creating the peer and now
+                // The easiest way to fix the problem is to just send it another update right now
+                p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+            }
+
+            self.tinfos.insert(p.id, info.clone());
+
+            debug!("Dhtree update.2");
+
+            if p.id == self.parent {
+                if self.wait {
+                    panic!("this should never happen");
+                }
+
+                let mut do_wait = false;
+                if tree_less(&self.self_info.as_ref().unwrap().root, &info.root) {
+                    do_wait = true; // worse root
+                } else if info.root == self.self_info.as_ref().unwrap().root
+                    && info.seq <= self.self_info.as_ref().unwrap().seq
+                {
+                    do_wait = true; // same root and seq
+                }
+
+                self.self_info = None; // The old self/parent are now invalid
+                self.parent = PeerId::nil();
+
+                if do_wait {
+                    // FIXME this is a hack
+                    //  We seem to busyloop if we process parent updates immediately
+                    //  E.g. we get bad news and immediately switch to a different peer
+                    //  Then we get more bad news and switch again, etc...
+                    // Set self to root, send, then process things correctly 1 second later
+                    self.wait = true;
+                    self.self_info = Some(TreeInfo::new(self.core.crypto.public_key.clone()));
+                    self._send_tree().await; // send bad news immediately
+                    debug!("Dhtree update. send tree .2");
+
+                    let handle = self.handle();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(PEER_TIMEOUT + Duration::from_secs(1)).await;
+                        handle.do_update_fix();
+                    });
+
+                    // self.wait = false;
+                    // self.self_info = None;
+                    // self.parent = None;
+                    // self._fix().await;
+                    // self._do_bootstrap().await;
+                }
+            }
         }
-
-        self.tinfos.insert(p.id, info.clone());
-
-        debug!("Dhtree update.2");
-
-        if p.id == self.parent {
-            if self.wait {
-                panic!("this should never happen");
-            }
-
-            let mut do_wait = false;
-            if tree_less(&self.self_info.as_ref().unwrap().root, &info.root) {
-                do_wait = true; // worse root
-            } else if info.root == self.self_info.as_ref().unwrap().root
-                && info.seq <= self.self_info.as_ref().unwrap().seq
-            {
-                do_wait = true; // same root and seq
-            }
-
-            self.self_info = None; // The old self/parent are now invalid
-            self.parent = PeerId::nil();
-
-            if do_wait {
-                // FIXME this is a hack
-                //  We seem to busyloop if we process parent updates immediately
-                //  E.g. we get bad news and immediately switch to a different peer
-                //  Then we get more bad news and switch again, etc...
-                // Set self to root, send, then process things correctly 1 second later
-                self.wait = true;
-                self.self_info = Some(TreeInfo::new(self.core.crypto.public_key.clone()));
-                self._send_tree().await; // send bad news immediately
-                debug!("Dhtree update. send tree .2");
-
-                let handle = self.handle();
-                tokio::spawn(async move {
-                    tokio::time::sleep(PEER_TIMEOUT + Duration::from_secs(1)).await;
-                    handle.do_update_fix();
-                });
-
-                // self.wait = false;
-                // self.self_info = None;
-                // self.parent = None;
-                // self._fix().await;
-                // self._do_bootstrap().await;
-            }
-        }
-
         if !self.wait {
             self._fix().await;
             self._do_bootstrap().await;
@@ -718,21 +720,22 @@ impl Dhtree {
             } else if dist > best_dist || tree_less(&info.from(), &best.from()) {
                 is_better = true;
             } else if let Some(peer) = &best_peer {
-                let p = self.peers.get_peer(*p);
-                if peer.key == p.key
-                    && p.prio.load(atomic::Ordering::SeqCst)
-                        < peer.prio.load(atomic::Ordering::SeqCst)
-                {
-                    // It's another link to the same next-hop node, but this link has a
-                    // higher priority than the chosen one, so prefer it instead
-                    is_better = true;
+                if let Some(p) = self.peers.get_peer(*p) {
+                    if peer.key == p.key
+                        && p.prio.load(atomic::Ordering::SeqCst)
+                            < peer.prio.load(atomic::Ordering::SeqCst)
+                    {
+                        // It's another link to the same next-hop node, but this link has a
+                        // higher priority than the chosen one, so prefer it instead
+                        is_better = true;
+                    }
                 }
             }
 
             if is_better {
                 best = info;
                 best_dist = dist;
-                best_peer = Some(self.peers.get_peer(*p));
+                best_peer = self.peers.get_peer(*p);
             }
         }
 
@@ -851,9 +854,10 @@ impl Dhtree {
         debug!("lookup.4");
         self.tinfos.iter().for_each(|(p, _)| {
             debug!("_dht_lookup {:?}", p);
-            let key = &self.peers.get_peer(*p).key;
-            if &state.borrow().0/*best*/ == key {
-                do_update(&mut state, key.clone(), *p, None);
+            if let Some(peer) = &self.peers.get_peer(*p) {
+                if state.borrow().0/*best*/ == peer.key {
+                    do_update(&mut state, peer.key.clone(), *p, None);
+                }
             }
         });
 
@@ -867,8 +871,7 @@ impl Dhtree {
 
         let best_peer = state.borrow().1.filter(|&pid| pid != PeerId::nil());
         let best_peer = if let Some(pid) = best_peer {
-            let pid = self.peers.get_peer(pid);
-            Some(pid)
+            self.peers.get_peer(pid)
         } else {
             None
         };
@@ -877,16 +880,17 @@ impl Dhtree {
         if let Some(best_peer) = best_peer.as_ref() {
             for (p, _) in self.tinfos.iter() {
                 debug!("lookup.7.0");
-                let p = self.peers.get_peer(*p);
-                debug!("lookup.7.1");
-                if p.key == best_peer.key
-                    && p.prio.load(atomic::Ordering::Relaxed)
-                        < best_peer.prio.load(atomic::Ordering::Relaxed)
-                {
-                    debug!("lookup.7.2");
-                    do_update(&mut state, p.key.clone(), p.id, None);
+                if let Some(p) = self.peers.get_peer(*p) {
+                    debug!("lookup.7.1");
+                    if p.key == best_peer.key
+                        && p.prio.load(atomic::Ordering::Relaxed)
+                            < best_peer.prio.load(atomic::Ordering::Relaxed)
+                    {
+                        debug!("lookup.7.2");
+                        do_update(&mut state, p.key.clone(), p.id, None);
+                    }
+                    debug!("lookup.7.3");
                 }
-                debug!("lookup.7.3");
             }
             debug!("lookup.7.4");
             debug!("_dht_lookup {}", best_peer.id);
@@ -928,7 +932,9 @@ impl Dhtree {
         if next != PeerId::nil() {
             debug!("Dhtree _handle_bootstrap.1.1");
             debug!("send to peer.");
-            self.peers.get_peer(next).send_bootstrap(bootstrap).unwrap();
+            if let Some(p) = self.peers.get_peer(next) {
+                p.send_bootstrap(bootstrap).unwrap()
+            }
             debug!("Dhtree _handle_bootstrap.end");
             return;
         } else if source == self.core.crypto.public_key {
@@ -1039,10 +1045,9 @@ impl Dhtree {
         if next.is_none() && !dest.eq(&self.core.crypto.public_key) {
             // FIXME? this has problems if prev is self (from changes to tree state?)
             if prev != PeerId::nil() {
-                self.peers
-                    .get_peer(prev)
-                    .send_teardown(&setup.get_teardown())
-                    .unwrap();
+                if let Some(p) = self.peers.get_peer(prev) {
+                    p.send_teardown(&setup.get_teardown()).unwrap()
+                }
             }
             debug!("--_handle_setup.1");
             return;
@@ -1062,10 +1067,9 @@ impl Dhtree {
         {
             // Wrong root or mismatched seq
             if prev != PeerId::nil() {
-                self.peers
-                    .get_peer(prev)
-                    .send_teardown(&setup.get_teardown())
-                    .unwrap();
+                if let Some(p) = self.peers.get_peer(prev) {
+                    p.send_teardown(&setup.get_teardown()).unwrap()
+                }
             }
             debug!("--_handle_setup.2");
             return;
@@ -1074,10 +1078,9 @@ impl Dhtree {
         if self.dinfos.contains_key(&dinfo.get_map_key()) {
             // Already have a path from this source
             if prev != PeerId::nil() {
-                self.peers
-                    .get_peer(prev)
-                    .send_teardown(&setup.get_teardown())
-                    .unwrap();
+                if let Some(p) = self.peers.get_peer(prev) {
+                    p.send_teardown(&setup.get_teardown()).unwrap()
+                }
             }
             debug!("--_handle_setup.3");
             return;
@@ -1085,10 +1088,9 @@ impl Dhtree {
         debug!("  _handle_setup.3");
         let dinfo = Arc::new(dinfo);
         if !self.dht_add(dinfo.clone()) && prev != PeerId::nil() {
-            self.peers
-                .get_peer(prev)
-                .send_teardown(&setup.get_teardown())
-                .unwrap();
+            if let Some(p) = self.peers.get_peer(prev) {
+                p.send_teardown(&setup.get_teardown()).unwrap()
+            }
         }
         let dinfo_key = dinfo.get_map_key();
 
@@ -1173,8 +1175,9 @@ impl Dhtree {
             self.dinfos.remove(&key);
 
             if !next.is_nil() {
-                let next = self.peers.get_peer(next);
-                next.send_teardown(teardown).unwrap();
+                if let Some(next) = self.peers.get_peer(next) {
+                    next.send_teardown(teardown).unwrap()
+                }
             }
             if let Some(next) = &self.next {
                 if next == &dinfo {

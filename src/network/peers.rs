@@ -35,7 +35,7 @@ pub const PEER_TIMEOUT: Duration = Duration::from_secs(6);
 pub enum PeersMessages {
     HandlePathTraffic(PathTraffic),
     HandlePathResponse(PathResponse),
-    GetPeer(PeerId, oneshot::Sender<Arc<Peer>>),
+    GetPeer(PeerId, oneshot::Sender<Option<Arc<Peer>>>),
     AddPeer(
         PublicKeyBytes,
         Box<dyn Conn>,
@@ -85,7 +85,7 @@ impl PeersHandle {
             PeersMessages::HandlePathTraffic(tr),
         ));
     }
-    pub async fn get_peer(&self, pid: PeerId) -> Arc<Peer> {
+    pub async fn get_peer(&self, pid: PeerId) -> Option<Arc<Peer>> {
         let (tx, rx) = oneshot::channel();
         self.dhtree
             .queue
@@ -141,13 +141,14 @@ impl Peers {
         )
     }
 
-    pub fn get_peer(&self, pid: PeerId) -> Arc<Peer> {
+    pub fn get_peer(&self, pid: PeerId) -> Option<Arc<Peer>> {
         for (_, p) in self.peers.iter() {
             if p.id == pid {
-                return p.clone();
+                return Some(p.clone());
             }
         }
-        panic!("Peer {pid} not found!");
+        //panic!("Peer {pid} not found!");
+        None
     }
 
     pub fn add_peer(

@@ -260,8 +260,9 @@ impl Pathfinder {
         tokio::spawn(async move {
             let pid = dhtree.dht_lookup(n.dest.clone(), false).await;
             if pid != PeerId::nil() {
-                let next = core.peers.get_peer(pid).await;
-                next.send_path_notify(n).unwrap();
+                if let Some(next) = core.peers.get_peer(pid).await {
+                    next.send_path_notify(n).unwrap();
+                }
             } else if let Some(l) = self_clone.get_lookup(&n).await {
                 self_clone.handle_lookup(l).await;
             }
@@ -280,8 +281,9 @@ impl Pathfinder {
             .tree_lookup(l.notify.label.as_ref().unwrap().clone())
             .await;
         if pid != PeerId::nil() {
-            let next = core.peers.get_peer(pid).await;
-            next.send_path_lookup(l).unwrap();
+            if let Some(next) = core.peers.get_peer(pid).await {
+                next.send_path_lookup(l).unwrap();
+            }
         } else if let Some(r) = self_clone.get_response(&l) {
             core.peers.handle_path_response(r);
         }

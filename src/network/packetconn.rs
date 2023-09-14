@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     network::crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
-    types::{Addr, Conn},
+    types::{Addr, CloseChannelRx, Conn},
 };
 use ed25519_dalek::SecretKey;
 use log::debug;
@@ -153,6 +153,7 @@ impl PacketConn {
         key: PublicKeyBytes,
         conn: Box<dyn Conn>,
         prio: u8,
+        mut close: CloseChannelRx,
     ) -> Result<(), Box<dyn Error>> {
         let pk = key;
         let core = self.core.clone();
@@ -160,7 +161,10 @@ impl PacketConn {
             return Err("attempted to connect to self".into());
         }
         let (p, conn) = core.peers.add_peer(pk, conn, prio).await?;
-        let _ = conn.handler().await;
+        select! {
+            _ = conn.handler() => {},
+            _ = close.recv() => {},
+        }
         core.peers.remove_peer(p.port).await;
         Ok(())
     }
