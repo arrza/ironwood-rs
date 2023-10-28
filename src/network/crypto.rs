@@ -31,6 +31,12 @@ impl PublicKeyBytes {
         self.0
     }
 
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut inner = [0; PUBLIC_KEY_SIZE];
+        inner.copy_from_slice(&bytes[..PUBLIC_KEY_SIZE]);
+        PublicKeyBytes(inner)
+    }
+
     pub fn verify(&self, message: &[u8], sig: &[u8]) -> bool {
         // Convert the PublicKeyBytes to a dalek PublicKey
         let pub_key = PublicKey::from_bytes(&self.0).unwrap();
