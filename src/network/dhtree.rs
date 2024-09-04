@@ -717,7 +717,8 @@ impl Dhtree {
             let mut is_better = false;
             if dist < best_dist {
                 is_better = true;
-            } else if dist > best_dist || tree_less(&info.from(), &best.from()) {
+            } else if dist > best_dist {
+            } else if tree_less(&info.from(), &best.from()) {
                 is_better = true;
             } else if let Some(peer) = &best_peer {
                 if let Some(p) = self.peers.get_peer(*p) {
