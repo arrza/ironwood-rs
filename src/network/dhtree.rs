@@ -1,8 +1,8 @@
 use super::{
     core::Core,
     crypto::{PrivateKeyBytes, PublicKeyBytes, SignatureBytes, PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
-    pathfinder::{PathTraffic, PathfinderHandle},
-    peers::{Peer, PeerId, Peers, PeersMessages, PEER_TIMEOUT},
+    pathfinder::{PathTraffic, Pathfinder},
+    peers::{Peer, PeerId, PEER_TIMEOUT},
     wire::{encode_path, Decode, Encode, WireDecodeError},
 };
 use crate::types::PeerPort;
@@ -12,15 +12,16 @@ use integer_encoding::{VarInt, VarIntReader};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Borrow,
     cmp,
     collections::{HashMap, HashSet},
-    fmt::{self},
+    fmt,
     io::{Cursor, Read},
-    sync::{atomic, Arc},
+    sync::{
+        atomic::{self, AtomicBool, AtomicU64},
+        Arc, Mutex, RwLock, Weak,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, oneshot};
 
 pub const TREE_TIMEOUT_SECS: u64 = 60 * 60;
 pub const TREE_TIMEOUT: Duration = Duration::from_secs(TREE_TIMEOUT_SECS); // TODO: figure out what makes sense
@@ -62,171 +63,27 @@ pub struct DebugPathInfo {
 }
 
 #[derive(Debug)]
-pub struct Dhtree {
-    pub core: Arc<Core>,
-    pub pathfinder: PathfinderHandle,
-    peers: Peers,
+struct UpdateData {
     expired: HashMap<PublicKeyBytes, TreeExpiredInfo>,
-    tinfos: HashMap<PeerId, TreeInfo>,
-    dinfos: HashMap<DhtMapKey, Arc<DhtInfo>>,
-    self_info: Option<TreeInfo>, // 'self' is a reserved keyword in Rust, so renamed 'self' to 'self_info'.
-    parent: PeerId,
-    prev: Option<Arc<DhtInfo>>,
-    next: Option<Arc<DhtInfo>>,
-    dkeys: HashMap<Arc<DhtInfo>, PublicKeyBytes>,
-    seq: u64,
-    wait: bool,
     hseq: u64,
-    bwait: bool,
-    btimer: bool,
-    queue: mpsc::UnboundedReceiver<DhtreeMessages>,
-    handle: DhtreeHandle,
+    wait: bool,
 }
 
-#[derive(Debug)]
-pub enum DhtreeMessages {
-    DhtTraffic(DhtTraffic, bool),
-    Bootstrap(DhtBootstrap),
-    Remove(PeerId),
-    Teardown(PeerId, DhtTeardown),
-    BootstrapAck(DhtBootstrapAck),
-    Setup(PeerId, DhtSetup),
-    Update(TreeInfo, PeerId),
-    SendTraffic(DhtTraffic),
-    DhtLookup(PublicKeyBytes, bool, oneshot::Sender<PeerId>),
-    TreeLookup(TreeLabel, oneshot::Sender<PeerId>),
-    GetLabel(oneshot::Sender<TreeLabel>),
-    DoBootStrap,
-    DoFix,
-    Debug,
-    DoExpire(Option<TreeInfo>),
-    DoUpdateFix,
-    DoAfterBootstrap,
-    DoTimeHandleSetup(DhtMapKey),
-    PeersMessages(PeersMessages),
-    DebugGetDht(oneshot::Sender<Vec<DebugDHTInfo>>),
-    DebugGetSelf(oneshot::Sender<DebugSelfInfo>),
-    DebugGetPeers(oneshot::Sender<Vec<DebugPeerInfo>>),
-    DebugGetPaths(oneshot::Sender<Vec<DebugPathInfo>>),
-}
-
-#[derive(Clone, Debug)]
-pub struct DhtreeHandle {
-    pub queue: mpsc::UnboundedSender<DhtreeMessages>,
-}
-
-impl DhtreeHandle {
-    pub fn handle_dht_traffic(&self, tr: DhtTraffic, do_notify: bool) {
-        let queue = self.queue.clone();
-        queue
-            .send(DhtreeMessages::DhtTraffic(tr, do_notify))
-            .unwrap();
-    }
-    pub fn handle_bootstrap(&self, bootstrap: DhtBootstrap) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::Bootstrap(bootstrap)).unwrap();
-    }
-    pub fn remove(&self, p: PeerId) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::Remove(p)).unwrap();
-    }
-    pub fn teardown(&self, from: PeerId, teardown: DhtTeardown) {
-        let queue = self.queue.clone();
-        queue
-            .send(DhtreeMessages::Teardown(from, teardown))
-            .unwrap();
-    }
-    pub fn handle_bootstrap_ack(&self, ack: DhtBootstrapAck) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::BootstrapAck(ack)).unwrap();
-    }
-    pub fn handle_setup(&self, prev: PeerId, setup: DhtSetup) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::Setup(prev, setup)).unwrap();
-    }
-    pub fn update(&self, info: TreeInfo, p: PeerId) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::Update(info, p)).unwrap();
-    }
-    pub fn send_traffic(&self, tr: DhtTraffic) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::SendTraffic(tr)).unwrap();
-    }
-    pub fn do_bootstrap(&self) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::DoBootStrap).unwrap();
-    }
-    pub fn do_fix(&self) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::DoFix).unwrap();
-    }
-    pub fn debug(&self) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::Debug).unwrap();
-    }
-    fn do_expire(&self, ti: Option<TreeInfo>) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::DoExpire(ti)).unwrap();
-    }
-    fn do_update_fix(&self) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::DoUpdateFix).unwrap();
-    }
-    fn do_after_bootstrap(&self) {
-        let queue = self.queue.clone();
-        queue.send(DhtreeMessages::DoAfterBootstrap).unwrap();
-    }
-
-    fn do_time_handle_setup(&self, dinfo: DhtMapKey) {
-        let queue = self.queue.clone();
-        queue
-            .send(DhtreeMessages::DoTimeHandleSetup(dinfo))
-            .unwrap();
-    }
-
-    pub async fn dht_lookup(&self, dest: PublicKeyBytes, is_bootstrap: bool) -> PeerId {
-        let (tx, rx) = oneshot::channel();
-        self.queue
-            .send(DhtreeMessages::DhtLookup(dest, is_bootstrap, tx))
-            .unwrap();
-        rx.await.unwrap()
-    }
-    pub async fn tree_lookup(&self, dest: TreeLabel) -> PeerId {
-        let (tx, rx) = oneshot::channel();
-        self.queue
-            .send(DhtreeMessages::TreeLookup(dest, tx))
-            .unwrap();
-        rx.await.unwrap()
-    }
-    pub async fn get_label(&self) -> TreeLabel {
-        let (tx, rx) = oneshot::channel();
-        self.queue.send(DhtreeMessages::GetLabel(tx)).unwrap();
-        rx.await.unwrap()
-    }
-
-    pub async fn get_self(&self) -> DebugSelfInfo {
-        let (tx, rx) = oneshot::channel();
-        self.queue.send(DhtreeMessages::DebugGetSelf(tx)).unwrap();
-        rx.await.unwrap()
-    }
-
-    pub async fn get_dht(&self) -> Vec<DebugDHTInfo> {
-        let (tx, rx) = oneshot::channel();
-        self.queue.send(DhtreeMessages::DebugGetDht(tx)).unwrap();
-        rx.await.unwrap()
-    }
-
-    pub async fn get_peers(&self) -> Vec<DebugPeerInfo> {
-        let (tx, rx) = oneshot::channel();
-        self.queue.send(DhtreeMessages::DebugGetPeers(tx)).unwrap();
-        rx.await.unwrap()
-    }
-
-    pub async fn get_paths(&self) -> Vec<DebugPathInfo> {
-        let (tx, rx) = oneshot::channel();
-        self.queue.send(DhtreeMessages::DebugGetPaths(tx)).unwrap();
-        rx.await.unwrap()
-    }
+#[derive(Debug, Clone)]
+pub struct Dhtree {
+    core: Weak<Core>,
+    pub(super) pathfinder: Arc<Pathfinder>,
+    tinfos: Arc<RwLock<HashMap<PeerId, TreeInfo>>>,
+    dinfos: Arc<RwLock<HashMap<DhtMapKey, Arc<DhtInfo>>>>,
+    self_info: Arc<RwLock<Option<TreeInfo>>>, // 'self' is a reserved keyword in Rust, so renamed 'self' to 'self_info'.
+    parent: Arc<RwLock<PeerId>>,
+    prev: Arc<RwLock<Option<Arc<DhtInfo>>>>,
+    next: Arc<RwLock<Option<Arc<DhtInfo>>>>,
+    dkeys: Arc<RwLock<HashMap<Arc<DhtInfo>, PublicKeyBytes>>>,
+    seq: Arc<AtomicU64>,
+    bwait: Arc<AtomicBool>,
+    btimer: Arc<AtomicBool>,
+    update_data: Arc<Mutex<UpdateData>>,
 }
 
 #[derive(Debug)]
@@ -235,232 +92,130 @@ pub struct TreeExpiredInfo {
     time: SystemTime, // Rust equivalent of time.Time in Go
 }
 
-#[derive(Debug)]
-pub struct DhtreeQueue {
-    queue: mpsc::UnboundedReceiver<DhtreeMessages>,
-}
-
 impl Dhtree {
-    pub fn new() -> (DhtreeHandle, DhtreeQueue) {
-        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
-        let handle = DhtreeHandle { queue: queue_tx };
-        let queue = DhtreeQueue { queue: queue_rx };
-        (handle, queue)
+    pub fn new(core: Weak<Core>) -> Arc<Self> {
+        let dhtree = Arc::new_cyclic(|weak_dhtree| {
+            let pathfinder = Pathfinder::new(weak_dhtree.clone());
+            Dhtree {
+                core,
+                pathfinder: Arc::new(pathfinder),
+                tinfos: Arc::new(RwLock::new(HashMap::new())),
+                dinfos: Arc::new(RwLock::new(HashMap::new())),
+                self_info: Arc::new(RwLock::new(None)),
+                parent: Arc::new(RwLock::new(PeerId::nil())),
+                prev: Arc::new(RwLock::new(None)),
+                next: Arc::new(RwLock::new(None)),
+                dkeys: Arc::new(RwLock::new(HashMap::new())),
+                seq: Arc::new(AtomicU64::new(
+                    UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64
+                )),
+                bwait: Arc::new(AtomicBool::new(false)),
+                btimer: Arc::new(AtomicBool::new(true)),
+                update_data: Arc::new(Mutex::new(UpdateData {
+                    expired: HashMap::new(),
+                    hseq: 0,
+                    wait: false,
+                })),
+            }
+        });
+        dhtree
     }
-    pub fn build(
-        core: Arc<Core>,
-        pathfinder: PathfinderHandle,
-        handle: DhtreeHandle,
-        queue: DhtreeQueue,
-        peers: Peers,
-    ) -> Self {
-        Dhtree {
-            core,
-            pathfinder,
-            expired: HashMap::new(),
-            tinfos: HashMap::new(),
-            dinfos: HashMap::new(),
-            self_info: None,
-            parent: PeerId::nil(),
-            prev: None,
-            next: None,
-            dkeys: HashMap::new(),
-            seq: UNIX_EPOCH.elapsed().unwrap().as_nanos() as u64,
-            wait: false,
-            hseq: 0,
-            bwait: false,
-            btimer: true,
-            queue: queue.queue,
-            handle,
-            peers,
+
+    pub fn init(&self) {
+        self._fix();
+    }
+
+    pub fn core(&self) -> Arc<Core> {
+        self.core.upgrade().unwrap()
+    }
+
+    pub async fn get_dht(&self) -> Vec<DebugDHTInfo> {
+        let mut infos = Vec::new();
+        debug!("dinfos: {}", self.dinfos.read().unwrap().len());
+        for (_, dinfo) in self.dinfos.read().unwrap().iter() {
+            let mut info = DebugDHTInfo {
+                key: dinfo.key.clone(),
+                port: 0,
+                rest: 0,
+            };
+            if !dinfo.peer.is_nil() {
+                if let Some(peer) = self.core().peers.get_peer(dinfo.peer) {
+                    info.port = peer.port;
+                }
+            }
+            if !dinfo.rest.is_nil() {
+                if let Some(rest) = self.core().peers.get_peer(dinfo.rest) {
+                    info.rest = rest.port;
+                }
+            }
+            infos.push(info);
         }
+        infos
     }
 
-    pub async fn init(&mut self) {
-        self._fix().await
+    pub async fn get_self(&self) -> DebugSelfInfo {
+        let coords: Vec<_> = self
+            .self_info
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .hops
+            .iter()
+            .map(|h| h.port)
+            .collect();
+        let info = DebugSelfInfo {
+            key: self.core().crypto.public_key.clone(),
+            root: self
+                .self_info
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .root
+                .clone(),
+            coords,
+            updated: self.self_info.read().unwrap().as_ref().unwrap().time,
+        };
+        info
     }
 
-    pub fn handle(&self) -> DhtreeHandle {
-        self.handle.clone()
-    }
-
-    pub async fn handler(mut self) {
-        while let Some(msg) = self.queue.recv().await {
-            debug!("Dhtree msg ({:?})", msg);
-            match msg {
-                DhtreeMessages::DhtTraffic(tr, do_notify) => {
-                    if let Err(e) =
-                        tokio::time::timeout(WAIT_TIMEOUT, self.handle_dht_traffic(tr, do_notify))
-                            .await
-                    {
-                        error!("DhtTraffic timeout: {}", e)
-                    }
-                }
-                DhtreeMessages::Bootstrap(bootstrap) => self._handle_bootstrap(&bootstrap).await,
-                DhtreeMessages::Remove(p) => self.remove(p).await,
-                DhtreeMessages::Teardown(from, teardown) => self._teardown(from, &teardown).await,
-                DhtreeMessages::BootstrapAck(ack) => {
-                    if let Err(e) = self.handle_bootstrap_ack(&ack).await {
-                        error!("BootstrapAck handle error: {}", e);
-                    }
-                }
-                DhtreeMessages::Setup(prev, setup) => self._handle_setup(prev, &setup).await,
-                DhtreeMessages::Update(info, p) => self._update(info, p).await,
-                DhtreeMessages::SendTraffic(tr) => {
-                    if let Err(e) = tokio::time::timeout(WAIT_TIMEOUT, self.send_traffic(tr)).await
-                    {
-                        error!("Send traffic timeout: {:?}", e)
-                    }
-                }
-                DhtreeMessages::DhtLookup(dest, is_bootstrap, tx) => {
-                    let id = self
-                        ._dht_lookup(&dest, is_bootstrap)
-                        .map_or(PeerId::nil(), |v| v.id);
-                    tx.send(id).unwrap();
-                }
-                DhtreeMessages::TreeLookup(dest, tx) => {
-                    let id = self._tree_lookup(&dest).map_or(PeerId::nil(), |v| v.id);
-                    tx.send(id).unwrap();
-                }
-                DhtreeMessages::GetLabel(tx) => {
-                    let label = self.get_label();
-                    tx.send(label).unwrap();
-                }
-                DhtreeMessages::DoBootStrap => {
-                    self._do_bootstrap().await;
-                }
-                DhtreeMessages::DoFix => {
-                    self._fix().await;
-                }
-                DhtreeMessages::Debug => {
-                    debug!("Dhtree: check");
-                }
-                DhtreeMessages::DoExpire(ti) => {
-                    if self.self_info == ti {
-                        self.self_info = None;
-                        self.parent = PeerId::nil();
-                        self._fix().await;
-                        self._do_bootstrap().await;
-                    }
-                }
-                DhtreeMessages::DoUpdateFix => {
-                    self.wait = false;
-                    self.self_info = None;
-                    self.parent = PeerId::nil();
-                    self._fix().await;
-                    self._do_bootstrap().await;
-                }
-                DhtreeMessages::DoAfterBootstrap => {
-                    self.bwait = false;
-                    self.btimer = false;
-                    self._do_bootstrap().await;
-                }
-                DhtreeMessages::DoTimeHandleSetup(dinfo_key) => {
-                    if let Some(info) = self.dinfos.get(&dinfo_key) {
-                        if let Some(p) = self.peers.get_peer(info.peer) {
-                            p.send_teardown(&info.get_teardown()).unwrap()
-                        }
-                        self.handle.teardown(info.peer, info.get_teardown());
-                    }
-                }
-                DhtreeMessages::DebugGetDht(tx) => {
-                    let mut infos = Vec::new();
-                    debug!("dinfos: {}", self.dinfos.len());
-                    for (_, dinfo) in self.dinfos.iter() {
-                        let mut info = DebugDHTInfo {
-                            key: dinfo.key.clone(),
-                            port: 0,
-                            rest: 0,
-                        };
-                        if !dinfo.peer.is_nil() {
-                            if let Some(peer) = self.peers.get_peer(dinfo.peer) {
-                                info.port = peer.port;
-                            }
-                        }
-                        if !dinfo.rest.is_nil() {
-                            if let Some(rest) = self.peers.get_peer(dinfo.rest) {
-                                info.rest = rest.port;
-                            }
-                        }
-                        infos.push(info);
-                    }
-
-                    tx.send(infos).unwrap();
-                }
-                DhtreeMessages::DebugGetSelf(tx) => {
-                    let coords: Vec<_> = self
-                        .self_info
-                        .as_ref()
-                        .unwrap()
-                        .hops
-                        .iter()
-                        .map(|h| h.port)
-                        .collect();
-                    let info = DebugSelfInfo {
-                        key: self.core.crypto.public_key.clone(),
-                        root: self.self_info.as_ref().unwrap().root.clone(),
-                        coords,
-                        updated: self.self_info.as_ref().unwrap().time,
-                    };
-                    tx.send(info).unwrap();
-                }
-                DhtreeMessages::DebugGetPeers(tx) => {
-                    let mut infos = Vec::new();
-                    for (id, tinfo) in self.tinfos.iter() {
-                        if let Some(peer) = self.peers.get_peer(*id) {
-                            let info = DebugPeerInfo {
-                                key: peer.key.clone(),
-                                root: tinfo.root.clone(),
-                                coords: tinfo.hops.iter().map(|h| h.port).collect(),
-                                port: peer.port,
-                                updated: tinfo.time,
-                                priority: peer.prio.load(atomic::Ordering::Relaxed),
-                                remote_addr: peer.remote_addr.clone(),
-                            };
-                            infos.push(info);
-                        }
-                    }
-                    tx.send(infos).unwrap();
-                }
-                DhtreeMessages::DebugGetPaths(tx) => {
-                    let mut paths = Vec::new();
-                    for (key, path) in self.pathfinder.get_paths().iter() {
-                        let info = DebugPathInfo {
-                            key: key.clone(),
-                            path: path.path.clone(),
-                        };
-                        paths.push(info);
-                    }
-                    tx.send(paths).unwrap();
-                }
-                DhtreeMessages::PeersMessages(msg) => match msg {
-                    PeersMessages::HandlePathTraffic(tr) => {
-                        self.peers.handle_path_traffic(tr).unwrap();
-                    }
-                    PeersMessages::HandlePathResponse(pr) => {
-                        self.peers.handle_path_response(pr).await
-                    }
-                    PeersMessages::GetPeer(pid, tx) => tx.send(self.peers.get_peer(pid)).unwrap(),
-                    PeersMessages::AddPeer(key, conn, prio, tx) => {
-                        tx.send(
-                            self.peers
-                                .add_peer(key, conn, prio)
-                                .map_err(|e| e.to_string()),
-                        )
-                        .unwrap();
-                    }
-                    PeersMessages::RemovePeer(port, tx) => tx
-                        .send(self.peers.remove_peer(port).map_err(|e| e.to_string()))
-                        .unwrap(),
-                },
+    pub async fn get_peers(&self) -> Vec<DebugPeerInfo> {
+        let mut infos = Vec::new();
+        for (id, tinfo) in self.tinfos.read().unwrap().iter() {
+            if let Some(peer) = self.core().peers.get_peer(*id) {
+                let info = DebugPeerInfo {
+                    key: peer.key.clone(),
+                    root: tinfo.root.clone(),
+                    coords: tinfo.hops.iter().map(|h| h.port).collect(),
+                    port: peer.port,
+                    updated: tinfo.time,
+                    priority: peer.prio.load(atomic::Ordering::Relaxed),
+                    remote_addr: peer.remote_addr.clone(),
+                };
+                infos.push(info);
             }
         }
+        infos
     }
 
-    async fn _send_tree(&self) {
-        for pid in self.tinfos.keys() {
-            if let Some(p) = self.peers.get_peer(*pid) {
-                p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+    pub async fn get_paths(&self) -> Vec<DebugPathInfo> {
+        let mut paths = Vec::new();
+        for (key, path) in self.pathfinder.get_paths().iter() {
+            let info = DebugPathInfo {
+                key: key.clone(),
+                path: path.path.clone(),
+            };
+            paths.push(info);
+        }
+        paths
+    }
+
+    fn _send_tree(&self) {
+        for pid in self.tinfos.read().unwrap().keys() {
+            if let Some(p) = self.core().peers.get_peer(*pid) {
+                p.send_tree(self.self_info.read().unwrap().as_ref().unwrap())
+                    .unwrap();
             }
         }
     }
@@ -471,16 +226,27 @@ impl Dhtree {
     //
     //	that prevents a race where we immediately switch to a new parent, who tries to do the same with us
     //	this avoids the tons of traffic generated when nodes race to use each other as parents
-    async fn _update(&mut self, mut info: TreeInfo, p: PeerId) {
+    pub(crate) async fn update(&self, mut info: TreeInfo, p: PeerId) {
         debug!("Dhtree update.");
         // The tree info should have been checked before this point
         info.time = SystemTime::now(); // Order by processing time, not receiving time...
-        self.hseq += 1;
-        info.hseq = self.hseq; // Used to track order without comparing timestamps, since some platforms have *horrible* time resolution
+        {
+            let mut update_data = self.update_data.lock().unwrap();
+            update_data.hseq += 1;
+            info.hseq = update_data.hseq; // Used to track order without comparing timestamps, since some platforms have *horrible* time resolution
 
-        if let Some(exp) = self.expired.get(&info.root) {
-            if exp.seq < info.seq {
-                self.expired.insert(
+            if let Some(exp) = update_data.expired.get(&info.root) {
+                if exp.seq < info.seq {
+                    update_data.expired.insert(
+                        info.root.clone(),
+                        TreeExpiredInfo {
+                            seq: info.seq,
+                            time: info.time,
+                        },
+                    );
+                }
+            } else {
+                update_data.expired.insert(
                     info.root.clone(),
                     TreeExpiredInfo {
                         seq: info.seq,
@@ -488,44 +254,40 @@ impl Dhtree {
                     },
                 );
             }
-        } else {
-            self.expired.insert(
-                info.root.clone(),
-                TreeExpiredInfo {
-                    seq: info.seq,
-                    time: info.time,
-                },
-            );
         }
 
         debug!("Dhtree update.1");
-        if let Some(p) = self.peers.get_peer(p) {
-            if !self.tinfos.contains_key(&p.id) {
+        if let Some(p) = self.core().peers.get_peer(p) {
+            if !self.tinfos.read().unwrap().contains_key(&p.id) {
                 // The peer may have missed an update due to a race between creating the peer and now
                 // The easiest way to fix the problem is to just send it another update right now
-                p.send_tree(self.self_info.as_ref().unwrap()).unwrap();
+                p.send_tree(self.self_info.read().unwrap().as_ref().unwrap())
+                    .unwrap();
             }
 
-            self.tinfos.insert(p.id, info.clone());
+            self.tinfos.write().unwrap().insert(p.id, info.clone());
 
             debug!("Dhtree update.2");
 
-            if p.id == self.parent {
-                if self.wait {
+            if p.id == self.parent.read().unwrap().clone() {
+                if self.update_data.lock().unwrap().wait {
                     panic!("this should never happen");
                 }
 
                 let mut do_wait = false;
-                if tree_less(&self.self_info.as_ref().unwrap().root, &info.root) {
+                if tree_less(
+                    &self.self_info.read().unwrap().as_ref().unwrap().root,
+                    &info.root,
+                ) {
                     do_wait = true; // worse root
-                } else if info.root == self.self_info.as_ref().unwrap().root
-                    && info.seq <= self.self_info.as_ref().unwrap().seq
+                } else if info.root == self.self_info.read().unwrap().as_ref().unwrap().root
+                    && info.seq <= self.self_info.read().unwrap().as_ref().unwrap().seq
                 {
                     do_wait = true; // same root and seq
                 }
 
-                self.self_info = None; // The old self/parent are now invalid
-                self.parent = PeerId::nil();
+                *self.self_info.write().unwrap() = None; // The old self/parent are now invalid
+                *self.parent.write().unwrap() = PeerId::nil();
 
                 if do_wait {
                     // FIXME this is a hack
@@ -533,15 +295,20 @@ impl Dhtree {
                     //  E.g. we get bad news and immediately switch to a different peer
                     //  Then we get more bad news and switch again, etc...
                     // Set self to root, send, then process things correctly 1 second later
-                    self.wait = true;
-                    self.self_info = Some(TreeInfo::new(self.core.crypto.public_key.clone()));
-                    self._send_tree().await; // send bad news immediately
+                    self.update_data.lock().unwrap().wait = true;
+                    *self.self_info.write().unwrap() =
+                        Some(TreeInfo::new(self.core().crypto.public_key.clone()));
+                    self._send_tree(); // send bad news immediately
                     debug!("Dhtree update. send tree .2");
+                    let self_clone = self.clone();
 
-                    let handle = self.handle();
                     tokio::spawn(async move {
                         tokio::time::sleep(PEER_TIMEOUT + Duration::from_secs(1)).await;
-                        handle.do_update_fix();
+                        self_clone.update_data.lock().unwrap().wait = false;
+                        *self_clone.self_info.write().unwrap() = None;
+                        *self_clone.parent.write().unwrap() = PeerId::nil();
+                        self_clone._fix();
+                        self_clone.do_bootstrap().await;
                     });
 
                     // self.wait = false;
@@ -552,59 +319,60 @@ impl Dhtree {
                 }
             }
         }
-        if !self.wait {
-            self._fix().await;
-            self._do_bootstrap().await;
+        if !self.update_data.lock().unwrap().wait {
+            self._fix();
+            self.do_bootstrap().await;
         }
         debug!("Dhtree update finsihed.");
     }
 
     // remove removes a peer from the tree, along with any paths through that peer in the dht
-    async fn remove(&mut self, p: PeerId) {
-        let old_info = self.tinfos.remove(&p);
-        if self.self_info == old_info {
-            self.self_info = None;
-            self.parent = PeerId::nil();
-            self._fix().await;
+    pub(crate) async fn remove(&self, p: PeerId) {
+        let old_info = self.tinfos.write().unwrap().remove(&p);
+        if *self.self_info.read().unwrap() == old_info {
+            *self.self_info.write().unwrap() = None;
+            *self.parent.write().unwrap() = PeerId::nil();
+            self._fix();
         }
 
-        let dinfos: Vec<_> = { self.dinfos.values().cloned().collect() };
+        let dinfos: Vec<_> = { self.dinfos.read().unwrap().values().cloned().collect() };
         for dinfo in dinfos {
             if dinfo.peer == p || dinfo.rest == p {
-                self._teardown(p, &dinfo.get_teardown()).await;
+                self.teardown(p, &dinfo.get_teardown()).await;
             }
         }
     }
 
     // _fix selects the best parent (and is called in response to receiving a tree update)
     // if this is not the same as our current parent, then it sends a tree update to our peers and resets our prev/next in the dht
-    async fn _fix(&mut self) {
+    fn _fix(&self) {
         debug!("Dhtree fix.");
-        let old_self = self.self_info.clone();
+        let old_self = self.self_info.read().unwrap().clone();
 
-        if self.self_info.is_none()
+        if self.self_info.read().unwrap().is_none()
             || tree_less(
-                &self.core.crypto.public_key,
-                &self.self_info.as_ref().unwrap().root,
+                &self.core().crypto.public_key,
+                &self.self_info.read().unwrap().as_ref().unwrap().root,
             )
         {
             // Note that seq needs to be non-decreasing for the node to function as a root
             //  a timestamp it used to partly mitigate rollbacks from restarting
-            self.self_info = Some(TreeInfo {
-                root: self.core.crypto.public_key.clone(),
+            *self.self_info.write().unwrap() = Some(TreeInfo {
+                root: self.core().crypto.public_key.clone(),
                 seq: UNIX_EPOCH.elapsed().unwrap().as_secs(),
                 time: SystemTime::now(),
                 hseq: 0,
                 hops: Vec::new(),
             });
-            self.parent = PeerId::nil();
+            *self.parent.write().unwrap() = PeerId::nil();
         }
-        let tinfos = &self.tinfos;
+        let tinfos = &self.tinfos.read().unwrap();
         for (_, info) in tinfos.iter() {
             // Refill expired to include non-root nodes (in case we're replacing something)
-            if let Some(exp) = self.expired.get(&info.root) {
+            let mut update_data = self.update_data.lock().unwrap();
+            if let Some(exp) = update_data.expired.get(&info.root) {
                 if info.seq > exp.seq || (info.seq == exp.seq && info.time < exp.time) {
-                    self.expired.insert(
+                    update_data.expired.insert(
                         info.root.clone(),
                         TreeExpiredInfo {
                             seq: info.seq,
@@ -614,7 +382,7 @@ impl Dhtree {
                 }
             } else {
                 // Refill expired to include non-root nodes (in case we're replacing something)
-                self.expired.insert(
+                update_data.expired.insert(
                     info.root.clone(),
                     TreeExpiredInfo {
                         seq: info.seq,
@@ -625,7 +393,7 @@ impl Dhtree {
         }
 
         for (p, info) in tinfos.iter() {
-            if let Some(exp) = self.expired.get(&info.root) {
+            if let Some(exp) = self.update_data.lock().unwrap().expired.get(&info.root) {
                 if info.seq < exp.seq
                     || (info.seq == exp.seq && exp.time.elapsed().unwrap() > TREE_TIMEOUT)
                 {
@@ -635,49 +403,66 @@ impl Dhtree {
             if !info.check_loops() {
                 debug!("fix.1");
                 // This has a loop, e.g. it's from a child, so skip it
-            } else if tree_less(&info.root, &self.self_info.as_ref().unwrap().root) {
+            } else if tree_less(
+                &info.root,
+                &self.self_info.read().unwrap().as_ref().unwrap().root,
+            ) {
                 debug!("fix.2");
                 // This is a better root
-                self.self_info = Some(info.clone());
-                self.parent = *p;
-            } else if tree_less(&self.self_info.as_ref().unwrap().root, &info.root) {
+                *self.self_info.write().unwrap() = Some(info.clone());
+                *self.parent.write().unwrap() = *p;
+            } else if tree_less(
+                &self.self_info.read().unwrap().as_ref().unwrap().root,
+                &info.root,
+            ) {
                 debug!("fix.3");
                 // This is a worse root, so don't do anything with it
-            } else if info.seq > self.self_info.as_ref().unwrap().seq {
+            } else if info.seq > self.self_info.read().unwrap().as_ref().unwrap().seq {
                 debug!("fix.4");
                 // This is a newer sequence number, so update parent
-                self.self_info = Some(info.clone());
-                self.parent = *p;
-            } else if info.seq < self.self_info.as_ref().unwrap().seq {
+                *self.self_info.write().unwrap() = Some(info.clone());
+                *self.parent.write().unwrap() = *p;
+            } else if info.seq < self.self_info.read().unwrap().as_ref().unwrap().seq {
                 debug!("fix.5");
                 // This is an older sequence number, so ignore it
-            } else if info.hseq < self.self_info.as_ref().unwrap().hseq {
+            } else if info.hseq < self.self_info.read().unwrap().as_ref().unwrap().hseq {
                 debug!("fix.6");
                 // This info has been around for longer (e.g. the path is more stable)
-                self.self_info = Some(info.clone());
-                self.parent = *p;
+                *self.self_info.write().unwrap() = Some(info.clone());
+                *self.parent.write().unwrap() = *p;
             }
         }
-        debug!("fix: parent {}", self.parent);
+        debug!("fix: parent {}", self.parent.read().unwrap());
 
-        if self.self_info != old_self {
-            let delay = if self.self_info.as_ref().unwrap().root == self.core.crypto.public_key {
+        if self.self_info.read().unwrap().as_ref() != old_self.as_ref() {
+            let delay = if self.self_info.read().unwrap().as_ref().unwrap().root
+                == self.core().crypto.public_key
+            {
                 TREE_ANNOUNCE
             } else {
                 // Figure out when the root needs to time out
                 let stop_time = self
+                    .update_data
+                    .lock()
+                    .unwrap()
                     .expired
-                    .get(&self.self_info.as_ref().unwrap().root)
+                    .get(&self.self_info.read().unwrap().as_ref().unwrap().root)
                     .unwrap()
                     .time
                     + TREE_TIMEOUT;
                 stop_time.duration_since(SystemTime::now()).unwrap()
             };
-            let self_clone = self.self_info.clone();
-            let handle = self.handle();
+            let self_info_clone = self.self_info.read().unwrap().clone();
+            let self_clone = self.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
-                handle.do_expire(self_clone);
+
+                if self_clone.self_info.read().unwrap().as_ref() == self_info_clone.as_ref() {
+                    *self_clone.self_info.write().unwrap() = None;
+                    *self_clone.parent.write().unwrap() = PeerId::nil();
+                    self_clone._fix();
+                    self_clone.do_bootstrap().await;
+                }
                 // if self.self_info == self_clone {
                 //     self.self_info = None;
                 //     self.parent = None;
@@ -685,28 +470,31 @@ impl Dhtree {
                 //     self._do_bootstrap().await;
                 // }
             });
-            self._send_tree().await; // Send the tree update to our peers
+            self._send_tree(); // Send the tree update to our peers
         }
 
         // Clean up expired (remove anything worse than the current root)
-        self.expired
-            .retain(|v, _| !tree_less(&self.self_info.as_ref().unwrap().root, v));
+        self.update_data
+            .lock()
+            .unwrap()
+            .expired
+            .retain(|v, _| !tree_less(&self.self_info.read().unwrap().as_ref().unwrap().root, v));
         debug!("Dhtree fix finished.");
     }
 
     // _treeLookup selects the best next hop (in treespace) for the destination
-    fn _tree_lookup(&self, dest: &TreeLabel) -> Option<Arc<Peer>> {
+    pub(crate) fn tree_lookup(&self, dest: &TreeLabel) -> Option<Arc<Peer>> {
         debug!("++_tree_lookup. {}", dest);
-        if self.core.crypto.public_key == dest.key {
+        if self.core().crypto.public_key == dest.key {
             debug!("--_tree_lookup.None");
             return None;
         }
 
-        let mut best = self.self_info.as_ref().unwrap();
+        let mut best = self.self_info.read().unwrap().as_ref().unwrap().clone();
         let mut best_dist = best.dist(dest);
         let mut best_peer: Option<Arc<Peer>> = None;
-
-        for (p, info) in self.tinfos.iter() {
+        let tinfos = self.tinfos.read().unwrap();
+        for (p, info) in tinfos.iter() {
             if info.root != dest.root || info.seq != dest.seq {
                 continue;
             }
@@ -721,7 +509,7 @@ impl Dhtree {
             } else if tree_less(&info.from(), &best.from()) {
                 is_better = true;
             } else if let Some(peer) = &best_peer {
-                if let Some(p) = self.peers.get_peer(*p) {
+                if let Some(p) = self.core().peers.get_peer(*p) {
                     if peer.key == p.key
                         && p.prio.load(atomic::Ordering::SeqCst)
                             < peer.prio.load(atomic::Ordering::SeqCst)
@@ -734,9 +522,9 @@ impl Dhtree {
             }
 
             if is_better {
-                best = info;
+                best = info.clone();
                 best_dist = dist;
-                best_peer = self.peers.get_peer(*p);
+                best_peer = self.core().peers.get_peer(*p);
             }
         }
 
@@ -752,7 +540,11 @@ impl Dhtree {
     // _dhtLookup selects the next hop needed to route closer to the destination in dht keyspace
     // this only uses the source direction of paths through the dht
     // bootstraps use slightly different logic, since they need to stop short of the destination key
-    fn _dht_lookup(&self, dest: &PublicKeyBytes, is_bootstrap: bool) -> Option<Arc<Peer>> {
+    pub(crate) fn dht_lookup(
+        &self,
+        dest: &PublicKeyBytes,
+        is_bootstrap: bool,
+    ) -> Option<Arc<Peer>> {
         type State = (PublicKeyBytes, Option<PeerId>, Option<Arc<DhtInfo>>);
         fn do_update(state: &mut State, key: PublicKeyBytes, p: PeerId, d: Option<Arc<DhtInfo>>) {
             *state = (key, Some(p), d);
@@ -784,7 +576,7 @@ impl Dhtree {
                 do_checked_update(state, dest, is_bootstrap, hop.next.clone(), p, None);
                 let best_peer = state.1.as_ref();
                 if let Some(best_peer) = best_peer {
-                    if let Some(tinfo) = dhtree.tinfos.get(best_peer) {
+                    if let Some(tinfo) = dhtree.tinfos.read().unwrap().get(best_peer) {
                         if state.0 == hop.next && info.hseq < tinfo.hseq {
                             do_update(state, hop.next.clone(), p, None);
                         }
@@ -819,69 +611,76 @@ impl Dhtree {
         }
 
         // Start by defining variables and helper functions
-        let mut state = (self.core.crypto.public_key.clone(), None, None);
+        let mut state = (self.core().crypto.public_key.clone(), None, None);
 
         debug!("lookup.1 {}", dest);
-        if (is_bootstrap && state.borrow().0/*best*/ == *dest)
+        if (is_bootstrap && state.0/*best*/ == *dest)
             || dht_ordered(
-                &self.self_info.as_ref().unwrap().root,
+                &self.self_info.read().unwrap().as_ref().unwrap().root,
                 dest,
-                &state.borrow().0,
+                &state.0,
             )
         {
             do_update(
                 &mut state,
-                self.self_info.as_ref().unwrap().root.clone(),
-                self.parent,
+                self.self_info
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .clone(),
+                *self.parent.read().unwrap(),
                 None,
             );
         }
-        debug!("lookup.2: {}", self.parent);
+        debug!("lookup.2: {}", self.parent.read().unwrap());
 
         do_ancestry(
             &mut state,
             self,
             dest,
             is_bootstrap,
-            self.self_info.as_ref().unwrap(),
-            self.parent,
+            self.self_info.read().unwrap().as_ref().unwrap(),
+            *self.parent.read().unwrap(),
         );
 
         debug!("lookup.3");
-        for (p, info) in &self.tinfos {
+        for (p, info) in self.tinfos.read().unwrap().iter() {
             do_ancestry(&mut state, self, dest, is_bootstrap, info, *p);
         }
 
         debug!("lookup.4");
-        self.tinfos.iter().for_each(|(p, _)| {
+        self.tinfos.read().unwrap().iter().for_each(|(p, _)| {
             debug!("_dht_lookup {:?}", p);
-            if let Some(peer) = &self.peers.get_peer(*p) {
-                if state.borrow().0/*best*/ == peer.key {
+            if let Some(peer) = &self.core().peers.get_peer(*p) {
+                if state.0/*best*/ == peer.key {
                     do_update(&mut state, peer.key.clone(), *p, None);
                 }
             }
         });
 
         debug!("lookup.5");
-        self.dinfos.iter().for_each(|(_, info)| {
+        self.dinfos.read().unwrap().iter().for_each(|(_, info)| {
             debug!("_dht_lookup {:?}", info);
             do_dht(&mut state, dest, is_bootstrap, info);
         });
 
         debug!("lookup.6");
 
-        let best_peer = state.borrow().1.filter(|&pid| pid != PeerId::nil());
+        let best_peer = state.1.filter(|&pid| pid != PeerId::nil());
         let best_peer = if let Some(pid) = best_peer {
-            self.peers.get_peer(pid)
+            self.core().peers.get_peer(pid)
         } else {
             None
         };
 
         debug!("lookup.7");
         if let Some(best_peer) = best_peer.as_ref() {
-            for (p, _) in self.tinfos.iter() {
+            let tinfos = self.tinfos.read().unwrap();
+            for (p, _) in tinfos.iter() {
                 debug!("lookup.7.0");
-                if let Some(p) = self.peers.get_peer(*p) {
+                if let Some(p) = self.core().peers.get_peer(*p) {
                     debug!("lookup.7.1");
                     if p.key == best_peer.key
                         && p.prio.load(atomic::Ordering::Relaxed)
@@ -906,9 +705,12 @@ impl Dhtree {
     // it may return false if the path associated with the dhtInfo isn't allowed for some reason
     // e.g. we know a better prev/next for one of the nodes in the path, which can happen if there's multiple split rings that haven't converged on their own yet
     // as of writing, that never happens, it always adds and returns true
-    fn dht_add(&mut self, info: Arc<DhtInfo>) -> bool {
+    fn dht_add(&self, info: Arc<DhtInfo>) -> bool {
         // TODO? check existing paths, don't allow this one if the source/dest pair makes no sense
-        self.dinfos.insert(info.get_map_key(), info);
+        self.dinfos
+            .write()
+            .unwrap()
+            .insert(info.get_map_key(), info);
         true
     }
 
@@ -922,23 +724,23 @@ impl Dhtree {
     // _handleBootstrap takes a bootstrap packet and checks if we know of a better prev for the source node
     // if yes, then we forward to the next hop in the path towards that prev
     // if no, then we reply with a dhtBootstrapAck (unless sanity checks fail)
-    async fn _handle_bootstrap(&mut self, bootstrap: &DhtBootstrap) {
+    pub(super) async fn handle_bootstrap(&self, bootstrap: &DhtBootstrap) {
         debug!("Dhtree _handle_bootstrap.");
         debug!("Dhtree {:?}", bootstrap);
         let source = bootstrap.label.key.clone();
         let next = self
-            ._dht_lookup(&source, true)
+            .dht_lookup(&source, true)
             .map_or(PeerId::nil(), |v| v.id);
         debug!("Dhtree _handle_bootstrap.1");
         if next != PeerId::nil() {
             debug!("Dhtree _handle_bootstrap.1.1");
             debug!("send to peer.");
-            if let Some(p) = self.peers.get_peer(next) {
+            if let Some(p) = self.core().peers.get_peer(next) {
                 p.send_bootstrap(bootstrap).unwrap()
             }
             debug!("Dhtree _handle_bootstrap.end");
             return;
-        } else if source == self.core.crypto.public_key {
+        } else if source == self.core().crypto.public_key {
             debug!("Dhtree _handle_bootstrap.1.2");
             debug!("Dhtree _handle_bootstrap.end");
             return;
@@ -960,36 +762,49 @@ impl Dhtree {
     // if no, then we decide whether or not this node is better than our current prev
     // if yes, then we get rid of our current prev (if any) and start setting up a new path to the response node in the ack
     // if no, then we drop the bootstrap acknowledgement without doing anything
-    async fn handle_bootstrap_ack(&mut self, ack: &DhtBootstrapAck) -> Result<(), String> {
+    pub(super) async fn handle_bootstrap_ack(&self, ack: &DhtBootstrapAck) -> Result<(), String> {
         debug!("Dhtree _handle_bootstrap_ack.");
         let source = ack.response.dest.key.clone();
-        if let Some(next) = self._tree_lookup(&ack.bootstrap.label) {
+        if let Some(next) = self.tree_lookup(&ack.bootstrap.label) {
             debug!("Dhtree _handle_bootstrap_ack.1");
             next.send_bootstrap_ack(ack).map_err(|e| e.to_string())?;
             debug!("Dhtree _handle_bootstrap_ack.1.end");
             return Ok(());
         }
 
-        if self.core.crypto.public_key == source
-            || self.core.crypto.public_key != ack.bootstrap.label.key
-            || self.core.crypto.public_key != ack.response.source
-            || self.self_info.as_ref().unwrap().root != ack.response.dest.root
-            || self.self_info.as_ref().unwrap().seq != ack.response.dest.seq
+        if self.core().crypto.public_key == source
+            || self.core().crypto.public_key != ack.bootstrap.label.key
+            || self.core().crypto.public_key != ack.response.source
+            || self.self_info.read().unwrap().as_ref().unwrap().root != ack.response.dest.root
+            || self.self_info.read().unwrap().as_ref().unwrap().seq != ack.response.dest.seq
         {
             debug!("Dhtree _handle_bootstrap_ack.2.end");
             return Ok(());
-        } else if self.prev.as_ref().is_none()
+        } else if self.prev.read().unwrap().as_ref().is_none()
             || dht_ordered(
-                self.dkeys.get(self.prev.as_ref().unwrap()).unwrap(),
+                self.dkeys
+                    .read()
+                    .unwrap()
+                    .get(self.prev.read().unwrap().as_ref().unwrap())
+                    .unwrap(),
                 &source,
-                &self.core.crypto.public_key,
+                &self.core().crypto.public_key,
             )
         {
-        } else if &source != self.dkeys.get(self.prev.as_ref().unwrap()).unwrap() {
+        } else if &source
+            != self
+                .dkeys
+                .read()
+                .unwrap()
+                .get(self.prev.read().unwrap().as_ref().unwrap())
+                .unwrap()
+        {
             debug!("Dhtree _handle_bootstrap_ack.3.end");
             return Ok(());
-        } else if self.prev.as_ref().unwrap().root != self.self_info.as_ref().unwrap().root
-            || self.prev.as_ref().unwrap().root_seq != self.self_info.as_ref().unwrap().seq
+        } else if self.prev.read().unwrap().as_ref().unwrap().root
+            != self.self_info.read().unwrap().as_ref().unwrap().root
+            || self.prev.read().unwrap().as_ref().unwrap().root_seq
+                != self.self_info.read().unwrap().as_ref().unwrap().seq
         {
         } else {
             debug!("Dhtree _handle_bootstrap_ack.4.end");
@@ -1001,8 +816,8 @@ impl Dhtree {
             return Ok(());
         }
 
-        self.prev = None;
-        let dinfo_keys: Vec<_> = self.dinfos.keys().cloned().collect();
+        *self.prev.write().unwrap() = None;
+        let dinfo_keys: Vec<_> = self.dinfos.read().unwrap().keys().cloned().collect();
         for key in dinfo_keys {
             // Former prev need to be notified that we're no longer next
             // The only way to signal that is by tearing down the path
@@ -1010,43 +825,46 @@ impl Dhtree {
             //  From t.prev = nil when the tree changes, but kept around to bootstrap
             // So loop over paths and close any going to a *different* node than the current prev
             // The current prev can close the old path from that side after setup
-            let dinfo = &self.dinfos[&key];
-            if let Some(dest) = self.dkeys.get(dinfo) {
-                if dest != &source {
-                    self._teardown(PeerId::nil(), &dinfo.get_teardown()).await;
+            let dinfo = &self.dinfos.read().unwrap()[&key].clone();
+            if let Some(dest) = {
+                let dest = self.dkeys.read().unwrap().get(dinfo).cloned();
+                dest
+            } {
+                if dest != source {
+                    self.teardown(PeerId::nil(), &dinfo.get_teardown()).await;
                 }
             }
         }
 
         let setup = self._new_setup(&ack.response);
-        self._handle_setup(PeerId::nil(), &setup).await;
+        self.handle_setup(PeerId::nil(), &setup).await;
         debug!("Dhtree _handle_bootstrap_ack.end");
         Ok(())
     }
 
-    fn _new_setup(&mut self, token: &DhtSetupToken) -> DhtSetup {
-        self.seq += 1;
+    fn _new_setup(&self, token: &DhtSetupToken) -> DhtSetup {
+        let seq = self.seq.fetch_add(1, atomic::Ordering::Relaxed);
         let mut setup = DhtSetup {
             sig: Default::default(),
-            seq: self.seq,
+            seq: seq + 1,
             token: token.clone(),
         };
 
-        setup.sig = self.core.crypto.private_key.sign(&setup.bytes_for_sig());
+        setup.sig = self.core().crypto.private_key.sign(&setup.bytes_for_sig());
         setup
     }
 
     // _handleSetup checks if it's safe to add a path from the setup source to the setup destination
     // if we can't add it (due to no next hop to forward it to, or if we're the destination but we already have a better next, or if we already have a path from the same source node), then we send a teardown to remove the path from the network
     // otherwise, we add the path to our table, and forward it (if we're not the destination) or set it as our next path (if we are, tearing down our existing next if one exists)
-    async fn _handle_setup(&mut self, prev: PeerId, setup: &DhtSetup) {
+    pub(super) async fn handle_setup(&self, prev: PeerId, setup: &DhtSetup) {
         debug!("++_handle_setup");
-        let next = self._tree_lookup(&setup.token.dest);
+        let next = self.tree_lookup(&setup.token.dest);
         let dest = setup.token.dest.key.clone();
-        if next.is_none() && !dest.eq(&self.core.crypto.public_key) {
+        if next.is_none() && !dest.eq(&self.core().crypto.public_key) {
             // FIXME? this has problems if prev is self (from changes to tree state?)
             if prev != PeerId::nil() {
-                if let Some(p) = self.peers.get_peer(prev) {
+                if let Some(p) = self.core().peers.get_peer(prev) {
                     p.send_teardown(&setup.get_teardown()).unwrap()
                 }
             }
@@ -1063,12 +881,14 @@ impl Dhtree {
             root_seq: setup.token.dest.seq,
             timer: Instant::now(),
         };
-        if !dinfo.root.eq(&self.self_info.as_ref().unwrap().root)
-            || dinfo.root_seq != self.self_info.as_ref().unwrap().seq
+        if !dinfo
+            .root
+            .eq(&self.self_info.read().unwrap().as_ref().unwrap().root)
+            || dinfo.root_seq != self.self_info.read().unwrap().as_ref().unwrap().seq
         {
             // Wrong root or mismatched seq
             if prev != PeerId::nil() {
-                if let Some(p) = self.peers.get_peer(prev) {
+                if let Some(p) = self.core().peers.get_peer(prev) {
                     p.send_teardown(&setup.get_teardown()).unwrap()
                 }
             }
@@ -1076,10 +896,15 @@ impl Dhtree {
             return;
         }
         debug!("  _handle_setup.2");
-        if self.dinfos.contains_key(&dinfo.get_map_key()) {
+        if self
+            .dinfos
+            .read()
+            .unwrap()
+            .contains_key(&dinfo.get_map_key())
+        {
             // Already have a path from this source
             if prev != PeerId::nil() {
-                if let Some(p) = self.peers.get_peer(prev) {
+                if let Some(p) = self.core().peers.get_peer(prev) {
                     p.send_teardown(&setup.get_teardown()).unwrap()
                 }
             }
@@ -1089,33 +914,41 @@ impl Dhtree {
         debug!("  _handle_setup.3");
         let dinfo = Arc::new(dinfo);
         if !self.dht_add(dinfo.clone()) && prev != PeerId::nil() {
-            if let Some(p) = self.peers.get_peer(prev) {
+            if let Some(p) = self.core().peers.get_peer(prev) {
                 p.send_teardown(&setup.get_teardown()).unwrap()
             }
         }
         let dinfo_key = dinfo.get_map_key();
 
         debug!("  _handle_setup.4");
-        let handle = self.handle();
+        let self_clone = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(2 * TREE_TIMEOUT).await;
-            handle.do_time_handle_setup(dinfo_key);
+            if let Some(info) = {
+                let info = self_clone.dinfos.read().unwrap().get(&dinfo_key).cloned();
+                info
+            } {
+                if let Some(p) = self_clone.core().peers.get_peer(info.peer) {
+                    p.send_teardown(&info.get_teardown()).unwrap()
+                }
+                self_clone.teardown(info.peer, &info.get_teardown()).await;
+            }
         });
 
         if prev == PeerId::nil() {
-            if !setup.token.source.eq(&self.core.crypto.public_key) {
+            if !setup.token.source.eq(&self.core().crypto.public_key) {
                 panic!("wrong source");
-            } else if setup.seq != self.seq {
+            } else if setup.seq != self.seq.load(atomic::Ordering::Relaxed) {
                 panic!("wrong seq");
-            } else if self.prev.is_some() {
+            } else if self.prev.read().unwrap().is_some() {
                 panic!("already have a prev");
             }
-            self.prev = Some(dinfo.clone());
-            self.dkeys.insert(dinfo.clone(), dest);
+            *self.prev.write().unwrap() = Some(dinfo.clone());
+            self.dkeys.write().unwrap().insert(dinfo.clone(), dest);
         }
         if let Some(next) = next {
-            next.send_setup(setup).unwrap();
-        } else if self.next.is_some() {
+            next.send_setup(setup).await.unwrap();
+        } else if self.next.read().unwrap().is_some() {
             // TODO get this right!
             //  We need to replace the old next in most cases
             //  The exceptions are when:
@@ -1124,18 +957,23 @@ impl Dhtree {
             //  What happens when the dinfo matches, t.next does not, but t.next is still better?...
             //  Just doing something for now (replace next) but not sure that's right...
             let do_update = {
-                if !dinfo.root.eq(&self.self_info.as_ref().unwrap().root)
-                    || dinfo.root_seq != self.self_info.as_ref().unwrap().seq
+                if !dinfo
+                    .root
+                    .eq(&self.self_info.read().unwrap().as_ref().unwrap().root)
+                    || dinfo.root_seq != self.self_info.read().unwrap().as_ref().unwrap().seq
                 {
                     // The root/seq is bad, so don't update
                     false
-                } else if dinfo.key.eq(&self.next.as_ref().unwrap().key) {
+                } else if dinfo
+                    .key
+                    .eq(&self.next.read().unwrap().as_ref().unwrap().key)
+                {
                     // It's an update from the current next
                     true
                 } else if dht_ordered(
-                    &self.core.crypto.public_key,
+                    &self.core().crypto.public_key,
                     &dinfo.key,
-                    &self.next.as_ref().unwrap().key,
+                    &self.next.read().unwrap().as_ref().unwrap().key,
                 ) {
                     // It's an update from a better next
                     true
@@ -1144,21 +982,24 @@ impl Dhtree {
                 }
             };
             if do_update {
-                self._teardown(PeerId::nil(), &self.next.as_ref().unwrap().get_teardown())
-                    .await;
-                self.next = Some(dinfo);
+                let teardown = self.next.read().unwrap().as_ref().unwrap().get_teardown();
+                self.teardown(PeerId::nil(), &teardown).await;
+                *self.next.write().unwrap() = Some(dinfo);
             } else {
-                self._teardown(PeerId::nil(), &dinfo.get_teardown()).await;
+                self.teardown(PeerId::nil(), &dinfo.get_teardown()).await;
             }
         } else {
-            self.next = Some(dinfo);
+            *self.next.write().unwrap() = Some(dinfo);
         }
         debug!("--_handle_setup");
     }
 
-    async fn _teardown(&mut self, from: PeerId, teardown: &DhtTeardown) {
+    pub(super) async fn teardown(&self, from: PeerId, teardown: &DhtTeardown) {
         let key = teardown.get_map_key();
-        if let Some(dinfo) = self.dinfos.get(&key).cloned() {
+        if let Some(dinfo) = {
+            let dinfo = self.dinfos.read().unwrap().get(&key).cloned();
+            dinfo
+        } {
             if teardown.seq != dinfo.seq {
                 return;
             } else if teardown.key != dinfo.key {
@@ -1172,26 +1013,29 @@ impl Dhtree {
                 return; // panic("DEBUG teardown of path from wrong node")
             };
 
-            self.dkeys.remove(&dinfo);
-            self.dinfos.remove(&key);
+            self.dkeys.write().unwrap().remove(&dinfo);
+            self.dinfos.write().unwrap().remove(&key);
 
             if !next.is_nil() {
-                if let Some(next) = self.peers.get_peer(next) {
+                if let Some(next) = self.core().peers.get_peer(next) {
                     next.send_teardown(teardown).unwrap()
                 }
             }
-            if let Some(next) = &self.next {
+            if let Some(next) = self.next.read().unwrap().as_ref() {
                 if next == &dinfo {
-                    self.next = None;
+                    *self.next.write().unwrap() = None;
                 }
             }
-            if let Some(prev) = &self.prev {
-                if prev == &dinfo {
-                    self.prev = None;
+            if let Some(prev) = {
+                let prev = self.prev.read().unwrap().clone();
+                prev
+            } {
+                if prev == dinfo {
+                    *self.prev.write().unwrap() = None;
                     // It's possible that other bad news is incoming
                     // Delay bootstrap until we've processed any other queued messages
                     // TODO: Implement `act` method
-                    self._do_bootstrap().await;
+                    self.do_bootstrap().await;
                 }
             }
         }
@@ -1199,31 +1043,46 @@ impl Dhtree {
 
     // _doBootstrap decides whether or not to send a bootstrap packet
     // if a bootstrap is sent, then it sets things up to attempt to send another bootstrap at a later point
-    fn _do_bootstrap(&mut self) -> BoxFuture<'_, ()> {
+    fn do_bootstrap(&self) -> BoxFuture<'_, ()> {
         debug!("Dhtree do_bootstrap.");
+        let self_clone = self.clone();
         async move {
-            if !self.bwait && self.btimer {
-                if let Some(prev) = &self.prev {
-                    if prev.root == self.self_info.as_ref().unwrap().root
-                        && prev.root_seq == self.self_info.as_ref().unwrap().seq
+            if !self_clone.bwait.load(atomic::Ordering::Relaxed)
+                && self_clone.btimer.load(atomic::Ordering::Relaxed)
+            {
+                if let Some(prev) = self_clone.prev.read().unwrap().as_ref() {
+                    if prev.root == self_clone.self_info.read().unwrap().as_ref().unwrap().root
+                        && prev.root_seq
+                            == self_clone.self_info.read().unwrap().as_ref().unwrap().seq
                     {
                         debug!("Dhtree do_bootstrap. finished");
                         return;
                     }
                 }
-                if self.self_info.as_ref().unwrap().root != self.core.crypto.public_key {
-                    self._handle_bootstrap(&self._new_bootstrap()).await;
+                if self_clone.self_info.read().unwrap().as_ref().unwrap().root
+                    != self_clone.core().crypto.public_key
+                {
+                    self_clone
+                        .handle_bootstrap(&self_clone._new_bootstrap())
+                        .await;
                     // Don't immediately send more bootstraps if called again too quickly
                     // This helps prevent traffic spikes in some mobility scenarios
-                    self.bwait = true;
+                    self_clone.bwait.store(true, atomic::Ordering::Relaxed);
                 }
-                self.btimer = false;
-                let handle = self.handle();
+                self_clone.btimer.store(false, atomic::Ordering::Relaxed);
+                //let handle = self.handle();
+                let self_clone_clone = self_clone.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    handle.do_after_bootstrap();
+                    self_clone_clone
+                        .bwait
+                        .store(false, atomic::Ordering::Relaxed);
+                    self_clone_clone
+                        .btimer
+                        .store(false, atomic::Ordering::Relaxed);
+                    self_clone_clone.do_bootstrap().await;
                 });
-                self.btimer = true;
+                self_clone.btimer.store(true, atomic::Ordering::Relaxed);
                 // self.bwait = false;
                 // self._do_bootstrap().await;
                 debug!("Dhtree do_bootstrap. finished");
@@ -1236,12 +1095,12 @@ impl Dhtree {
 
     // handleDHTTraffic take a dht traffic packet (still marshaled as []bytes) and decides where to forward it to next to take it closer to its destination in keyspace
     // if there's nowhere better to send it, then it hands it off to be read out from the local PacketConn interface
-    async fn handle_dht_traffic(&self, tr: DhtTraffic, do_notify: bool) {
+    pub(super) async fn handle_dht_traffic(&self, tr: DhtTraffic, do_notify: bool) {
         debug!("++handle_dht_traffic");
-        let next = self._dht_lookup(&tr.dest, false);
+        let next = self.dht_lookup(&tr.dest, false);
         debug!("Dhtree handle_dht_traffic.1");
         if next.is_none() {
-            if tr.dest.eq(&self.core.crypto.public_key) {
+            if tr.dest.eq(&self.core().crypto.public_key) {
                 let dest = tr.source.clone();
                 let pathfinder = self.pathfinder.clone();
                 debug!("Dhtree handle_dht_traffic.1.2");
@@ -1250,7 +1109,7 @@ impl Dhtree {
                 //});
             }
             debug!("Dhtree handle_dht_traffic.1.3");
-            let pconn = self.core.pconn.clone();
+            let pconn = self.core().pconn.clone();
             //tokio::spawn(async move {
             pconn.handle_traffic(tr).await;
         //    });
@@ -1261,7 +1120,7 @@ impl Dhtree {
         debug!("--handle_dht_traffic");
     }
 
-    async fn send_traffic(&self, tr: DhtTraffic) {
+    pub async fn send_traffic(&self, tr: DhtTraffic) {
         debug!("++send_traffic");
         if let Some(path) = self.pathfinder.get_path(&tr.dest).await {
             debug!("Path: {:?}", path);
@@ -1270,7 +1129,7 @@ impl Dhtree {
                     path,
                     dt: tr.clone(),
                 };
-                if let Err(e) = self.peers.handle_path_traffic(pt) {
+                if let Err(e) = self.core().peers.handle_path_traffic(pt).await {
                     error!("  handle_path_traffic error: {:?}", e);
                 }
             } else {
@@ -1285,11 +1144,20 @@ impl Dhtree {
     pub fn get_label(&self) -> TreeLabel {
         // Fill easy fields of label
         let mut label = TreeLabel {
-            key: self.core.crypto.public_key.clone(),
-            root: self.self_info.as_ref().unwrap().root.clone(),
-            seq: self.self_info.as_ref().unwrap().seq,
+            key: self.core().crypto.public_key.clone(),
+            root: self
+                .self_info
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .root
+                .clone(),
+            seq: self.self_info.read().unwrap().as_ref().unwrap().seq,
             path: self
                 .self_info
+                .read()
+                .unwrap()
                 .as_ref()
                 .unwrap()
                 .hops
@@ -1300,7 +1168,7 @@ impl Dhtree {
         };
 
         let bs = label.bytes_for_sig();
-        label.sig = self.core.crypto.private_key.sign(&bs);
+        label.sig = self.core().crypto.private_key.sign(&bs);
         label
     }
 
@@ -1312,7 +1180,7 @@ impl Dhtree {
         };
 
         let bs = token.bytes_for_sig();
-        token.sig = self.core.crypto.private_key.sign(&bs);
+        token.sig = self.core().crypto.private_key.sign(&bs);
         token
     }
 }

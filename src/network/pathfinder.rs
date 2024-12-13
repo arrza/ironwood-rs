@@ -1,4 +1,4 @@
-use super::{core::Core, crypto::Crypto, dhtree::DhtreeHandle, peers::PeerId};
+use super::dhtree::Dhtree;
 use crate::{
     network::{
         crypto::{PublicKeyBytes, SignatureBytes, PUBLIC_KEY_SIZE, SIGNATURE_SIZE},
@@ -13,10 +13,9 @@ use std::{
     collections::HashMap,
     fmt,
     io::{Cursor, Read},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
 
 const PATHFINDER_TIMEOUT: Duration = Duration::from_secs(60);
 const PATHFINDER_THROTTLE: Duration = Duration::from_secs(1);
@@ -29,36 +28,104 @@ pub struct PathInfo {
 }
 
 #[derive(Debug)]
-enum PathfinderMessages {
-    DoNotify(PublicKeyBytes, bool),
-    HandleNotify(PathNotify),
-    HandleLookup(PathLookup),
-}
-
-#[derive(Debug)]
 pub struct Pathfinder {
-    core: Arc<Core>,
-    crypto: Arc<Crypto>,
-    dhtree: DhtreeHandle,
+    dhtree: Weak<Dhtree>,
     paths: Arc<Mutex<HashMap<PublicKeyBytes, PathInfo>>>,
-    queue: mpsc::Receiver<PathfinderMessages>,
-    queue_tx: mpsc::Sender<PathfinderMessages>,
 }
 
-#[derive(Clone, Debug)]
-pub struct PathfinderHandle {
-    crypto: Arc<Crypto>,
-    dhtree: DhtreeHandle,
-    paths: Arc<Mutex<HashMap<PublicKeyBytes, PathInfo>>>,
-    queue: mpsc::Sender<PathfinderMessages>,
-}
+impl Pathfinder {
+    pub fn new(dhtree: Weak<Dhtree>) -> Pathfinder {
+        Pathfinder {
+            paths: Arc::new(Mutex::new(HashMap::new())),
+            dhtree,
+        }
+    }
 
-#[derive(Debug)]
-pub struct PathfinderQueue {
-    queue: mpsc::Receiver<PathfinderMessages>,
-}
+    fn dhtree(&self) -> Arc<Dhtree> {
+        self.dhtree.upgrade().unwrap()
+    }
 
-impl PathfinderHandle {
+    async fn get_notify(&self, dest: &PublicKeyBytes, keep_alive: bool) -> Option<PathNotify> {
+        debug!("++get_notify");
+        let throttle = if keep_alive {
+            PATHFINDER_TIMEOUT
+        } else {
+            PATHFINDER_THROTTLE
+        };
+
+        let dhtree = self.dhtree().clone();
+        let mut need_label = false;
+        {
+            let mut paths = self.paths.lock().unwrap();
+            if let Some(info) = paths.get_mut(dest) {
+                if info.ntime.elapsed() > throttle {
+                    need_label = true;
+                }
+            }
+        }
+        let label = if need_label {
+            Some(dhtree.get_label())
+        } else {
+            None
+        };
+        let mut paths = self.paths.lock().unwrap();
+        debug!("  get_notify. lock");
+        if let Some(info) = paths.get_mut(dest) {
+            if info.ntime.elapsed() > throttle {
+                let mut n = PathNotify {
+                    sig: SignatureBytes::default(),
+                    dest: dest.clone(),
+                    label,
+                };
+                debug!("  get_notify. path not");
+
+                let mut bytes = Vec::new();
+                n.label.as_ref().unwrap().encode(&mut bytes);
+                let mut bs = Vec::new();
+                bs.extend_from_slice(dest.as_bytes());
+                bs.extend_from_slice(&bytes);
+                n.sig = self.dhtree().core().crypto.private_key.sign(&bs);
+                info.ntime = Instant::now();
+                debug!("--get_notify (Some)");
+                return Some(n);
+            }
+        }
+        debug!("--get_notify (None)");
+        None
+    }
+
+    pub(super) async fn handle_notify(&self, n: PathNotify) {
+        debug!("++handle_notify");
+        let dhtree = self.dhtree().clone();
+        if let Some(next) = dhtree.dht_lookup(&n.dest, false) {
+            next.send_path_notify(n).unwrap();
+        } else if let Some(l) = self.get_lookup(&n).await {
+            self.handle_lookup(l).await;
+        }
+        debug!("--handle_notify");
+    }
+
+    pub async fn handle_lookup(&self, l: PathLookup) {
+        debug!("++handle_lookup");
+        // TODO? check the tree_label at some point
+        let core = self.dhtree().core().clone();
+        let dhtree = self.dhtree().clone();
+        //tokio::spawn(async move {
+        if let Some(next) = dhtree.tree_lookup(l.notify.label.as_ref().unwrap()) {
+            next.send_path_lookup(l).unwrap();
+        } else if let Some(r) = self.get_response(&l) {
+            core.peers.handle_path_response(r).await;
+        }
+        //});
+        debug!("--handle_lookup");
+    }
+
+    pub(crate) async fn do_notify(&self, dest: &PublicKeyBytes, keep_alive: bool) {
+        if let Some(n) = self.get_notify(dest, keep_alive).await {
+            self.handle_notify(n).await;
+        }
+    }
+
     pub fn get_paths(&self) -> MutexGuard<HashMap<PublicKeyBytes, PathInfo>> {
         self.paths.lock().unwrap()
     }
@@ -95,25 +162,17 @@ impl PathfinderHandle {
 
         Some(info.path)
     }
-    pub async fn handle_notify(&self, n: PathNotify) {
-        self.queue.send(PathfinderMessages::HandleNotify(n)).await;
-    }
-    pub async fn do_notify(&self, dest: &PublicKeyBytes, keep_alive: bool) {
-        self.queue
-            .send(PathfinderMessages::DoNotify(dest.clone(), keep_alive))
-            .await;
-    }
 
     fn get_response(&self, l: &PathLookup) -> Option<PathResponse> {
         // Check if lookup comes from us
         let dest = l.notify.label.as_ref().unwrap().key.clone();
-        if dest != self.crypto.public_key || !l.notify.check() {
+        if dest != self.dhtree().core().crypto.public_key || !l.notify.check() {
             // TODO? skip l.notify.check()? only check the last hop?
             return None;
         }
 
         let mut r = PathResponse {
-            from: self.crypto.public_key.clone(),
+            from: self.dhtree().core().crypto.public_key.clone(),
             path: l.rpath.iter().rev().cloned().collect(),
             rpath: Vec::new(),
         };
@@ -150,151 +209,6 @@ impl PathfinderHandle {
             info.path.push(PeerPort::default()); // equivalent to append(0)
         }
         debug!("--handle_response.");
-    }
-
-    pub async fn handle_lookup(&self, l: PathLookup) {
-        debug!("++handle_lookup");
-        self.queue.send(PathfinderMessages::HandleLookup(l)).await;
-        debug!("--handle_lookup");
-    }
-}
-
-impl Pathfinder {
-    pub fn new(dhtree: DhtreeHandle, crypto: Arc<Crypto>) -> (PathfinderHandle, PathfinderQueue) {
-        let (queue_tx, queue_rx) = mpsc::channel(100);
-        let handle = PathfinderHandle {
-            paths: Arc::new(Mutex::new(HashMap::new())),
-            dhtree,
-            queue: queue_tx,
-            crypto,
-        };
-        (handle, PathfinderQueue { queue: queue_rx })
-    }
-
-    pub fn build(core: Arc<Core>, handle: PathfinderHandle, queue: PathfinderQueue) -> Pathfinder {
-        Pathfinder {
-            core,
-            dhtree: handle.dhtree.clone(),
-            paths: handle.paths.clone(),
-            queue: queue.queue,
-            queue_tx: handle.queue,
-            crypto: handle.crypto,
-        }
-    }
-
-    pub async fn handler(mut self) {
-        while let Some(msg) = self.queue.recv().await {
-            match msg {
-                PathfinderMessages::DoNotify(dest, keep_alive) => {
-                    self.do_notify(&dest, keep_alive).await
-                }
-                PathfinderMessages::HandleNotify(n) => self.handle_notify(n).await,
-                PathfinderMessages::HandleLookup(l) => self.handle_lookup(l).await,
-            }
-        }
-    }
-
-    pub fn handle(&self) -> PathfinderHandle {
-        PathfinderHandle {
-            dhtree: self.dhtree.clone(),
-            paths: self.paths.clone(),
-            queue: self.queue_tx.clone(),
-            crypto: self.crypto.clone(),
-        }
-    }
-
-    async fn get_notify(&self, dest: &PublicKeyBytes, keep_alive: bool) -> Option<PathNotify> {
-        debug!("++get_notify");
-        let throttle = if keep_alive {
-            PATHFINDER_TIMEOUT
-        } else {
-            PATHFINDER_THROTTLE
-        };
-
-        let dhtree = self.dhtree.clone();
-        let mut need_label = false;
-        {
-            let mut paths = self.paths.lock().unwrap();
-            if let Some(info) = paths.get_mut(dest) {
-                if info.ntime.elapsed() > throttle {
-                    need_label = true;
-                }
-            }
-        }
-        let label = if need_label {
-            Some(dhtree.get_label().await)
-        } else {
-            None
-        };
-        let mut paths = self.paths.lock().unwrap();
-        debug!("  get_notify. lock");
-        if let Some(info) = paths.get_mut(dest) {
-            if info.ntime.elapsed() > throttle {
-                let mut n = PathNotify {
-                    sig: SignatureBytes::default(),
-                    dest: dest.clone(),
-                    label,
-                };
-                debug!("  get_notify. path not");
-
-                let mut bytes = Vec::new();
-                n.label.as_ref().unwrap().encode(&mut bytes);
-                let mut bs = Vec::new();
-                bs.extend_from_slice(dest.as_bytes());
-                bs.extend_from_slice(&bytes);
-                n.sig = self.core.crypto.private_key.sign(&bs);
-                info.ntime = Instant::now();
-                debug!("--get_notify (Some)");
-                return Some(n);
-            }
-        }
-        debug!("--get_notify (None)");
-        None
-    }
-
-    async fn handle_notify(&self, n: PathNotify) {
-        debug!("++handle_notify");
-        let core = self.core.clone();
-        let dhtree = self.dhtree.clone();
-        let self_clone = self.handle();
-        tokio::spawn(async move {
-            let pid = dhtree.dht_lookup(n.dest.clone(), false).await;
-            if pid != PeerId::nil() {
-                if let Some(next) = core.peers.get_peer(pid).await {
-                    next.send_path_notify(n).unwrap();
-                }
-            } else if let Some(l) = self_clone.get_lookup(&n).await {
-                self_clone.handle_lookup(l).await;
-            }
-        });
-        debug!("--handle_notify");
-    }
-
-    pub async fn handle_lookup(&self, l: PathLookup) {
-        debug!("++handle_lookup");
-        // TODO? check the tree_label at some point
-        let core = self.core.clone();
-        let dhtree = self.dhtree.clone();
-        let self_clone = self.handle();
-        //tokio::spawn(async move {
-        let pid = dhtree
-            .tree_lookup(l.notify.label.as_ref().unwrap().clone())
-            .await;
-        if pid != PeerId::nil() {
-            if let Some(next) = core.peers.get_peer(pid).await {
-                next.send_path_lookup(l).unwrap();
-            }
-        } else if let Some(r) = self_clone.get_response(&l) {
-            core.peers.handle_path_response(r);
-        }
-        //});
-        debug!("--handle_lookup");
-    }
-
-    async fn do_notify(&self, dest: &PublicKeyBytes, keep_alive: bool) {
-        if let Some(n) = self.get_notify(dest, keep_alive).await {
-            self.handle_notify(n).await;
-        }
     }
 }
 
@@ -509,7 +423,7 @@ impl Decode for PathResponse {
 
 #[derive(Debug, Clone)]
 pub struct PathLookup {
-    notify: PathNotify,
+    pub notify: PathNotify,
     pub rpath: Vec<PeerPort>,
 }
 

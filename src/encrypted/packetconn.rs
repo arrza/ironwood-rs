@@ -53,7 +53,7 @@ impl PacketConn {
         secret: &SecretKey,
         oob_handler: Option<OobHandlerTx>,
     ) -> (Arc<Self>, PacketConnRead) {
-        let (raw_pconn, raw_pconn_read, dhtree) = RawPacketConn::new(secret, oob_handler);
+        let (raw_pconn, raw_pconn_read) = RawPacketConn::new(secret, oob_handler);
         let (sessions_handle, sessions_queue) = SessionManager::new();
         let (net_handle, mut net_mgr, net_mgr_read) =
             NetManager::new(raw_pconn_read, sessions_handle.clone());

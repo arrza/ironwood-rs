@@ -1,7 +1,7 @@
 use super::{
     core::Core,
     crypto::{Crypto, PublicKeyBytes},
-    dhtree::{DhtTraffic, DhtreeHandle},
+    dhtree::DhtTraffic,
     wire::WireTraffic,
 };
 use crate::{
@@ -88,7 +88,7 @@ impl PacketConn {
     pub fn new(
         secret: &SecretKey,
         oob_handler: Option<OobHandlerTx>,
-    ) -> (PacketConn, PacketConnRead, DhtreeHandle) {
+    ) -> (PacketConn, PacketConnRead) {
         let (recv_tx, recv) = mpsc::channel(10);
         let crypto = Arc::new(Crypto::new(secret));
         let closed = Arc::new(AtomicBool::new(false));
@@ -100,19 +100,13 @@ impl PacketConn {
         };
 
         let pconn_read = PacketConnRead { recv };
-        let (core, mut dhtree, pathfinder) = Core::new(crypto, handle);
-        tokio::spawn(async move {
-            select! {
-                _ = async move{dhtree.init().await;dhtree.handler().await;} => {} ,
-                _ = pathfinder.handler() => {}
-            }
-        });
+        let core = Core::new(crypto, handle);
         let pconn = PacketConn {
             core: core.clone(),
             closed,
         };
 
-        (pconn, pconn_read, core.dhtree.clone())
+        (pconn, pconn_read)
     }
 
     // The write_to method fulfills the net.PacketConn interface, with a types.Addr expected as the destination address.
@@ -128,7 +122,7 @@ impl PacketConn {
             kind: WireTraffic::Standard.into(),
             payload: p.to_vec(),
         };
-        self.core.dhtree.send_traffic(tr);
+        self.core.dhtree.send_traffic(tr).await;
         debug!("--write_to");
         Ok(p.len())
     }
@@ -160,12 +154,12 @@ impl PacketConn {
         if core.crypto.public_key.eq(&pk) {
             return Err("attempted to connect to self".into());
         }
-        let (p, conn) = core.peers.add_peer(pk, conn, prio).await?;
+        let (p, conn) = core.peers.add_peer(pk, conn, prio)?;
         select! {
             _ = conn.handler() => {},
             _ = close.recv() => {},
         }
-        core.peers.remove_peer(p.port).await;
+        core.peers.remove_peer(p.port);
         Ok(())
     }
 
@@ -183,7 +177,7 @@ impl PacketConn {
             kind: WireTraffic::OutOfBand.into(),
             payload: data,
         };
-        self.core.dhtree.send_traffic(tr);
+        self.core.dhtree.send_traffic(tr).await;
         Ok(())
     }
 
